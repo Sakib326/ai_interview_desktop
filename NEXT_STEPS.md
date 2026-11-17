@@ -120,8 +120,10 @@ revived:
    real microphone on the target machine.
 3. **Loopback capture.** Not implemented (mic only). Required before interviewer
    questions can be transcribed without headphones/room audio.
-4. **Packaging.** Decide PyInstaller vs uv; pick a neutral binary name
-   (`initialize-plan.md` §10.4); installer + signing; document PortAudio.
+4. **Packaging.** PyInstaller one-folder build is in place
+   (`packaging/build.ps1` → `dist\overlay\overlay.exe`, neutral name per
+   `initialize-plan.md` §10.4; verified: prints `captured 1600 bytes` and stays
+   running). Remaining: Windows installer and code signing.
 5. **Live smoke with provider keys.** The HTTP/WS lifecycle is verified; the
    transcription → answer path still needs `ASSEMBLYAI_API_KEY` /
    `OPENROUTER_API_KEY` (or a config switch to `stub_stt` + a deterministic

@@ -44,6 +44,20 @@ python -m venv .venv
 Real capture needs PortAudio (`sudo apt install libportaudio2` on
 Debian/Ubuntu). Tests do not.
 
+### Build a Windows binary
+
+```powershell
+.venv\Scripts\pip install -e ".[build]"
+.\packaging\build.ps1              # windowed: dist\overlay\overlay.exe
+.\packaging\build.ps1 -Console     # console build for debugging
+```
+
+Output is one-folder (`overlay.exe` + `_internal\`), not a single file: faster
+startup and fewer AV false positives. The name `overlay` is deliberate
+(`initialize-plan.md` §10.4). Ship the whole `dist\overlay` directory and put
+`.env` next to `overlay.exe` — the app resolves `.env` from its working
+directory. No installer or code signing yet.
+
 ---
 
 ## Run
