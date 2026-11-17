@@ -140,6 +140,17 @@ async def mic_frames(
         # Never yield here: aclose()/cancellation throws GeneratorExit at the
         # current suspension point, and yielding from finally raises
         # "async generator ignored GeneratorExit".
+        #
+        # On a *graceful* stop, frames captured but not yet consumed are still
+        # sitting in the queue (up to max_queue_frames). Drain them so the last
+        # words before Stop are not silently dropped; the tail flush below
+        # emits them as padded 50 ms frames.
+        if stop_event is not None and stop_event.is_set():
+            while True:
+                try:
+                    tail_buffer.extend(queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
         if stream is not None:
             try:
                 stream.stop()

@@ -21,9 +21,9 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QShortcut,
+    QTextCursor,
 )
 from PySide6.QtWidgets import (
-    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -68,6 +68,7 @@ class OverlayWindow(QWidget):
 
     closed = Signal()
     stop_requested = Signal()
+    retry_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -96,8 +97,8 @@ class OverlayWindow(QWidget):
         self._init_ui()
         self._setup_shortcuts()
 
-        self.resize(560, 320)
-        self.setMinimumSize(420, 220)
+        self.resize(640, 460)
+        self.setMinimumSize(460, 280)
 
     def _init_ui(self):
         """Construct the layout: status row, transcript area, and controls row."""
@@ -168,6 +169,42 @@ class OverlayWindow(QWidget):
         )
         main_layout.addWidget(self.transcript_edit, stretch=1)
 
+        # ---------------- 2b. Live answer area ----------------
+        self.answer_header = QLabel("answer", self)
+        self.answer_header.setStyleSheet(
+            "color: #6ee7b7; font-size: 11px; font-weight: bold; "
+            "letter-spacing: 1px; background: transparent;"
+        )
+        self.answer_header.hide()
+        main_layout.addWidget(self.answer_header)
+
+        self.answer_edit = QTextEdit(self)
+        self.answer_edit.setReadOnly(True)
+        self.answer_edit.setFrameShape(QFrame.Shape.NoFrame)
+        self.answer_edit.setStyleSheet(
+            """
+            QTextEdit {
+                background: rgba(16, 185, 129, 0.08);
+                color: #ecfdf5;
+                font-size: 13px;
+                border: none;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QScrollBar:vertical {
+                background: rgba(255, 255, 255, 10);
+                width: 6px;
+                border-radius: 3px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255, 255, 255, 60);
+                border-radius: 3px;
+            }
+            """
+        )
+        self.answer_edit.hide()
+        main_layout.addWidget(self.answer_edit, stretch=1)
+
         # Separate QLabel for mutable partials to prevent full-text reflow on every delta
         self.partial_label = QLabel(self)
         self.partial_label.setWordWrap(True)
@@ -195,6 +232,15 @@ class OverlayWindow(QWidget):
         self.controls_layout.addWidget(self.stealth_btn)
 
         self.controls_layout.addStretch()
+
+        self.retry_btn = QPushButton("Retry", self)
+        self.retry_btn.setStyleSheet(
+            "QPushButton { background: rgba(251,191,36,0.25); color: #fcd34d; border-radius: 6px; padding: 4px 12px; font-size: 11px; border: none; }"
+            "QPushButton:hover { background: rgba(251,191,36,0.45); color: #ffffff; }"
+        )
+        self.retry_btn.clicked.connect(self.retry_requested.emit)
+        self.retry_btn.hide()
+        self.controls_layout.addWidget(self.retry_btn)
 
         self.stop_btn = QPushButton("Stop", self)
         self.stop_btn.setStyleSheet(
@@ -352,6 +398,71 @@ class OverlayWindow(QWidget):
     def set_model(self, text: str):
         """Set the model name badge."""
         self.model_label.setText(text)
+
+    # ---------------- Transcript / answer rendering ----------------
+    def set_turns(self, turns):
+        """Render [(label, text), ...] as the finalized transcript."""
+        lines = [f"{label}: {text}" for label, text in turns]
+        self.transcript_edit.setPlainText("\n".join(lines))
+        scrollbar = self.transcript_edit.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _ensure_answer_visible(self):
+        if not self.answer_header.isVisible():
+            self.answer_header.show()
+            self.answer_edit.show()
+
+    def set_answer_loading(self):
+        """Show the answer pane with a pending placeholder."""
+        self._ensure_answer_visible()
+        self.answer_header.setText("answer")
+        self.answer_edit.setPlainText("thinking\u2026")
+        self._scroll_answer()
+
+    def append_answer_token(self, text: str):
+        """Append one streamed answer token."""
+        self._ensure_answer_visible()
+        self.answer_header.setText("answer")
+        if self.answer_edit.toPlainText() == "thinking\u2026":
+            self.answer_edit.setPlainText("")
+        cursor = self.answer_edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(text)
+        self.answer_edit.setTextCursor(cursor)
+        self._scroll_answer()
+
+    def set_answer(self, text: str, title: str = "answer"):
+        """Replace the answer pane with the validated final answer."""
+        self._ensure_answer_visible()
+        self.answer_header.setText(title)
+        self.answer_edit.setPlainText(text)
+        self._scroll_answer()
+
+    def set_answer_error(self, message: str, retryable: bool = False):
+        self._ensure_answer_visible()
+        self.answer_header.setText("answer unavailable")
+        self.answer_edit.setPlainText(message)
+        self.retry_btn.setVisible(retryable)
+        self._scroll_answer()
+
+    def clear_answer(self):
+        self.answer_edit.clear()
+        self.answer_edit.hide()
+        self.answer_header.hide()
+        self.retry_btn.hide()
+
+    def _scroll_answer(self):
+        scrollbar = self.answer_edit.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def set_capture_state(self, state: str):
+        """Reflect the backend capture_status snapshot for the mic source."""
+        if state == "active":
+            self.set_status("listening")
+        elif state == "paused":
+            self.set_status("paused")
+        elif state == "inactive":
+            self.set_status("stopped")
 
     def set_stealth_state(self, state: StealthState):
         """Update stealth state field and UI badge (§10.5)."""

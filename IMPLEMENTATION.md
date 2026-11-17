@@ -1,256 +1,244 @@
-# PySide6 Desktop Client — Full Implementation Guide (Zero to All)
+# PySide6 Desktop Client — Full Implementation Guide
 
-This document provides a comprehensive, end-to-end technical overview of the `desktop_client` skeleton implementation: its design principles, architecture, component contracts, lifecycle management, verification results, and roadmap for future iterations.
+Covers the skeleton (overlay, capture, stealth) and the backend integration
+built on top of it: `/events`, `/audio`, live answers, debrief, memory, global
+hotkeys, and the tray.
 
 ---
 
 ## 1. Executive Summary & Design Principles
 
-### Scope and Boundaries
-- **Scope:** Skeleton only — PySide6 desktop UI overlay, asynchronous microphone audio capture (50 ms frames), and OS-level window capture exclusion (stealth).
-- **Platform Focus:** Windows is the primary platform for capture exclusion (`SetWindowDisplayAffinity`). macOS and Linux render identically and support all UI and audio features, but report capture exclusion as `UNSUPPORTED`.
-- **Zero Backend Touched:** No server code, backend WebSocket routes, or existing contracts were modified.
-- **Display-Only:** Display only; no text-to-speech (TTS), no automatic audio injection.
+### Scope and boundaries
+- **UI:** desktop overlay for a Live session. Display-only; no TTS, no audio
+  injection.
+- **Transport:** the canonical product path — `WS /sessions/{id}/events` +
+  `WS /sessions/{id}/audio` — not `/stt`.
+- **Platform focus:** Windows for capture exclusion. macOS/Linux render and
+  capture normally but report `UNSUPPORTED` stealth.
+- **Backend:** read-only dependency. No server changes were made; two API gaps
+  are handled client-side and documented (§6).
 
-### Two Orthogonal Axes
-The client strictly decouples input behavior from capture visibility:
-
+### Three orthogonal axes
 | Axis | Mechanism | Effect |
 |---|---|---|
-| **Capture Visibility (Stealth)** | `SetWindowDisplayAffinity` (Windows API) | Window omitted from screen shares, recordings, screenshots |
-| **Input Transparency (Click-Through)** | `WindowTransparentForInput` (Qt Window Flag) | Mouse clicks pass through to background applications |
+| Capture visibility (stealth) | `SetWindowDisplayAffinity` | Window omitted from shares/recordings |
+| Input transparency (click-through) | `WindowTransparentForInput` | Clicks pass to apps underneath |
+| Keyboard reachability | `RegisterHotKey` + tray | Control the overlay without focus |
 
-*Note:* Stealth is **never** implemented via `WA_TransparentForMouseEvents`, and click-through toggling never breaks the native handle's display affinity.
+They are never merged: stealth is not implemented with
+`WA_TransparentForMouseEvents`, and click-through never disables stealth.
 
 ---
 
 ## 2. Package Architecture
 
 ```text
-ai_desktop/
-├── pyproject.toml              # Project dependencies, packaging, and pytest configuration
-├── README.md                   # Quickstart instructions and status checklist
-├── IMPLEMENTATION.md           # Full technical documentation (this file)
-├── desktop_client/             # Core client package
-│   ├── __init__.py             # Version metadata
-│   ├── stealth.py              # Windows SetWindowDisplayAffinity wrapper & state machine
-│   ├── audio.py                # sounddevice.RawInputStream capture & 50 ms framing
-│   ├── overlay.py              # PySide6 translucent always-on-top overlay widget
-│   └── main.py                 # Async application entry point powered by qasync
-└── tests/
-    └── test_desktop_client.py  # Comprehensive automated unit test suite (19 tests)
+desktop_client/
+├── __init__.py     # version
+├── config.py       # Settings: env then .env, ws origin derivation
+├── api.py          # httpx REST + SSE client, ApiError, SSE frame parser
+├── events.py       # /events socket: dispatch, heartbeat, reconnect, resubscribe
+├── audio.py        # sounddevice RawInputStream -> 1,600-byte frames
+├── audio_ws.py     # /audio socket: binary frames, audio_end, closed/failed
+├── transcript.py   # dedup by turn/segment, ordering, authoritative merge
+├── session.py      # LiveSessionController: ordered lifecycle
+├── overlay.py      # QWidget overlay, transcript + answer panes
+├── stealth.py      # Windows display affinity wrapper
+├── hotkeys.py      # global hotkeys + tray menu
+└── main.py         # qasync entry point, CLI, offline fallback
 ```
 
----
-
-## 3. Detailed Component Breakdown
-
-### 3.1 Stealth Capture Exclusion (`desktop_client/stealth.py`)
-
-#### State Model
-```python
-class StealthState(Enum):
-    EXCLUDED    = "excluded"     # OS confirmed complete capture exclusion (WDA_EXCLUDEFROMCAPTURE)
-    BLACK_BOX   = "black_box"    # Excluded as opaque black rectangle (WDA_MONITOR)
-    UNSUPPORTED = "unsupported"  # Non-Windows platform (macOS/Linux)
-    FAILED      = "failed"       # Windows API present but call rejected by OS/compositor
-```
-
-#### Constants
-- `WDA_NONE = 0x00`: Remove all display affinity (window is fully capture-visible).
-- `WDA_MONITOR = 0x01`: Window is rendered as black box on non-monitor captures.
-- `WDA_EXCLUDEFROMCAPTURE = 0x11`: Requests capture exclusion. Behavior varies by OS build, compositor, and capture tool; verify the matrix in `initialize-plan.md` §10.6. Not a guarantee.
-
-#### Implementation Details & Rules
-1. **Thread Discipline:** Must only be called on the GUI thread after `widget.show()`.
-2. **Handle Lifecycle:** The native window handle (`int(widget.winId())`) is **never cached** on widget instances because Qt destroys and recreates HWNDs whenever window flags change.
-3. **Build Version Gating:**
-   - On Windows 10 2004+ (Build ≥ 19041) and Windows 11: Attempts `0x11` first.
-   - If `0x11` fails or on older Windows builds: Falls back to `0x01` (`BLACK_BOX`).
-   - If both fail: Logs `GetLastError()` and returns `FAILED`.
-4. **Platform Isolation:** On non-Windows platforms, returns `UNSUPPORTED` immediately without attempting to load `ctypes.windll`.
-5. **Idempotent Clear:** `clear(widget)` applies `WDA_NONE` safely.
+Dependency direction is one-way: `main -> session -> {api, events, audio_ws,
+transcript}`, with `overlay` a passive view. `audio` and `stealth` stay leaf
+modules.
 
 ---
 
-### 3.2 Translucent Overlay (`desktop_client/overlay.py`)
+## 3. Component Breakdown
 
-The overlay is implemented as a specialized `QWidget` subclass designed to float unobtrusively over fullscreen applications and video conferences.
+### 3.1 Configuration (`config.py`)
+- Precedence: process environment, then `.env`. A `.env` file never overrides a
+  set env var.
+- `api_base_url` -> `api_v1`; `ws_base_url` is derived when absent
+  (`http`→`ws`, `https`→`wss`).
+- Booleans accept `1/true/yes/on`.
+- `configured` (token present) selects live vs capture-only mode.
 
-#### Window Configuration & Attributes
-- **Flags:**
-  - `Qt.WindowType.FramelessWindowHint`: Removes standard OS title bar and borders.
-  - `Qt.WindowType.WindowStaysOnTopHint`: Keeps overlay pinned above video calls and apps.
-  - `Qt.WindowType.Tool`: Excludes overlay from Alt-Tab switchers and taskbar enumeration.
-  - `Qt.WindowType.WindowDoesNotAcceptFocus`: Prevents stealing keyboard focus from active work.
-- **Attributes:**
-  - `Qt.WidgetAttribute.WA_TranslucentBackground`: Allows per-pixel alpha transparency.
-  - `Qt.WidgetAttribute.WA_ShowWithoutActivating`: Shows window without taking system focus.
-- **Neutral Window Title:** Titled `"Overlay"` rather than sensitive names to prevent heuristic window-title matching by detector tools.
+### 3.2 REST + SSE client (`api.py`)
+- `ApiClient` wraps only the endpoints the overlay needs. Base URL is
+  `{api_base_url}/api/v1`.
+- `ApiError(status_code, code, message, retryable, detail)` is the single error
+  shape. `detail` objects and strings from FastAPI are both flattened; 401 is
+  never retryable, 429/5xx are.
+- `parse_sse_stream` is a spec-tolerant parser: `event:`/`data:` fields, multi
+  line data, comment lines (`:`), and malformed JSON frames are dropped with a
+  warning instead of raising.
+- `answer()` streams with `httpx.AsyncClient.stream` and a stable
+  `Idempotency-Key: answer-<question_turn_id>`, so a retry replays the recorded
+  answer rather than regenerating it.
+- `end_session` uses `end-<session_id>` for the same reason.
 
-#### Layout Structure
-1. **Status Row:**
-   - `PulsingDot`: Custom animated widget oscillating alpha between 90 and 255 at ~25 FPS.
-   - `status_label`: Displays `"listening"` or current operational status.
-   - `stealth_badge`: Pill badge displaying live state:
-     - `EXCLUDED` → `"hidden from share"` (dim green `#4ade80`, bg `#14532d`)
-     - `BLACK_BOX` → `"hidden (opaque)"` (dim amber `#fbbf24`, bg `#78350f`)
-     - `FAILED` → `"capture exclusion failed"` (dim red `#f87171`, bg `#7f1d1d`)
-     - `UNSUPPORTED` → `"visible to share"` (dim gray `#9ca3af`, bg `#374151`)
-   - `model_label`: Right-aligned model indicator (e.g. `"gemini-2.5-flash"`).
-2. **Transcript Area:**
-   - `transcript_edit`: Read-only `QTextEdit` with transparent background for finalized turns. Auto-scrolls to newest turn.
-   - `partial_label`: Dedicated `QLabel` for interim partial transcripts. Isolating partials here avoids expensive text layout reflows of the entire transcript on every speech delta.
-3. **Controls Row:**
-   - Click-through toggle (`F8`).
-   - Stealth toggle (`F9`).
-   - `"Stop"` and `"Close"` buttons.
+### 3.3 Events socket (`events.py`)
+- URL: `{ws}/api/v1/sessions/{id}/events`, authenticated with
+  `Sec-WebSocket-Protocol: bearer.<jwt>` (the backend selects the subprotocol).
+- Rejects `?token=` implicitly by never using it; the server closes `4401`.
+- The initial `session.status_changed` is consumed before any transcript event.
+- Heartbeat every 20 s by default (configurable, clamped to 1–30 s). The server
+  closes `1000` after 65 s of client silence.
+- Reconnect loop with exponential backoff (`1s` → `30s`, resettable for tests).
+- On reconnect, `client.resubscribe` with `last_known_sequence` — never
+  `client.ack`, which the backend treats as a metric only.
+- `system.replay_gap` is routed to a dedicated handler instead of the normal
+  event path; the controller refetches the transcript.
+- Close codes `4401/4403/4404` raise `EventStreamAuthError`, and `run()`
+  returns instead of retrying. Handshake 401/403 behaves the same way.
+- Sends are serialized behind a lock because heartbeats and resubscribe can
+  race.
 
-#### Re-Application Rules Across HWND Re-Creation (§10.3)
-When `setWindowFlag(Qt.WindowType.WindowTransparentForInput, enabled)` is called:
-1. Qt destroys the old native HWND and creates a new one asynchronously.
-2. The display affinity drops immediately.
-3. To resolve this, `OverlayWindow` schedules stealth re-application via `QTimer.singleShot(0, self._reapply_stealth)`.
-4. In `showEvent()`, the same `singleShot(0, ...)` rule ensures affinity is applied immediately upon presentation.
-5. In `paintEvent()`, if the current stealth state is `BLACK_BOX`, the background alpha is dynamically raised from `200` to `250` so that capture viewers see an intentional, crisp dark box rather than broken semi-transparent artifacts.
+### 3.4 Audio capture (`audio.py`)
+- `sounddevice.RawInputStream(samplerate=16000, channels=1, dtype="int16",
+  blocksize=800)`; 800 samples = 50 ms = 1,600 bytes.
+- PortAudio's realtime callback never touches asyncio directly: it schedules
+  `queue.get_nowait()`/`put_nowait()` via `loop.call_soon_threadsafe`.
+- Bounded queue (40 frames ≈ 2 s); on overflow the oldest frame is dropped with
+  a warning.
+- **Graceful stop drains the queue.** On `stop_event`, frames captured but not
+  yet consumed are moved into the tail buffer before the stream closes, so the
+  words spoken just before Stop are not silently lost. The residual partial
+  frame is zero-padded to 1,600 bytes.
+- Nothing is yielded from `finally`, so `aclose()`/cancellation cannot raise
+  "async generator ignored GeneratorExit".
 
-#### Click-Through Mechanics
-- Enabled: Sets `WindowTransparentForInput` flag at the window level. Clicks pass cleanly to windows underneath.
-- Disabled (Interactive mode): Clears `WindowTransparentForInput`.
-- *Key correction applied:* Does **not** set `WA_TransparentForMouseEvents` on the window instance, as Qt propagates that attribute to child buttons and disables their click handlers.
+### 3.5 Audio socket (`audio_ws.py`)
+- Sends raw bytes as binary frames; one 50 ms frame per message (within
+  AssemblyAI's 20–1,000 ms range, and the backend does no padding).
+- Appends `?source=mic|loopback` from config. The backend ignores unknown query
+  params today; this is forward-compatible with source tagging.
+- Sends `{"type":"client.audio_end"}` after the last frame, then awaits
+  `audio.closed` / `audio.failed` with a 12 s timeout.
+- Returns `AudioOutcome(status, error_class, retryable, message)` with
+  `closed | failed | disconnected | timeout` so the controller can distinguish
+  a provider failure from a dropped socket.
 
-#### Dragging
-- In interactive mode, clicking and dragging any non-button region moves the window.
-- Prefers `windowHandle().startSystemMove()` where supported, with manual position delta tracking fallback.
+### 3.6 Transcript state (`transcript.py`)
+- Finals are immutable turns, deduplicated by `turn_id` **and** `segment_id`
+  (a reconnect can replay both).
+- Deltas are keyed by `segment_id` and replace the text for that segment;
+  a final clears the matching partial.
+- Turns are kept sorted by `sequence_number` even if a replay arrives late.
+- `merge_authoritative(transcript)` merges `GET /transcript` rather than
+  replacing: the REST list can lag the event stream, and replacing with an
+  empty read would erase just-rendered finals. This is also the only source of
+  real `speaker` labels.
+
+### 3.7 Overlay (`overlay.py`)
+- Flags: `FramelessWindowHint | WindowStaysOnTopHint | Tool |
+  WindowDoesNotAcceptFocus`; attributes `WA_TranslucentBackground`,
+  `WA_ShowWithoutActivating`; neutral title `"Overlay"`.
+- Rounded-rect `paintEvent`; alpha rises to 250 when stealth degrades to
+  `BLACK_BOX` so the captured rectangle looks intentional.
+- Panels: status row (pulse dot, status, stealth badge, model), transcript
+  `QTextEdit`, a separate live-answer pane, a partial `QLabel`, and controls.
+- Answer API: `set_answer_loading`, `append_answer_token`, `set_answer(text,
+  title)`, `set_answer_error(message, retryable)`, `clear_answer`.
+- Transcript API: `set_turns([(label, text)])`; speaker labels come from the
+  store (`Interviewer` / `You` / `Assistant`).
+- The partial lives in its own label so deltas never reflow the transcript.
+
+### 3.8 Stealth (`stealth.py`)
+- States: `EXCLUDED` (0x11), `BLACK_BOX` (0x01 fallback), `UNSUPPORTED`
+  (non-Windows), `FAILED`.
+- Build-gated on 19041+; `0x11` then `0x01`; both failing is `FAILED`, not an
+  exception.
+- The HWND is read at call time and never cached — Qt destroys and recreates it
+  on `setWindowFlag`.
+- Re-applied in `showEvent` and via `QTimer.singleShot(0, ...)` after every flag
+  change (including click-through toggles).
+- `clear()` sets `WDA_NONE` and is idempotent.
+
+### 3.9 Hotkeys and tray (`hotkeys.py`)
+- `RegisterHotKey` on the overlay HWND with `MOD_NOREPEAT`; WM_HOTKEY is
+  dispatched by a `QAbstractNativeEventFilter` reading the native `MSG`.
+- Registered: F8 click-through, F9 stealth, F10 answer latest.
+- Unregistered on shutdown; registration failure logs and degrades to the
+  existing (unreliable) `QShortcut`s.
+- Tray icon is painted at runtime (no asset files) and exposes show/hide,
+  click-through, stealth, Stop, and Quit. This is the only escape from
+  click-through mode, which blocks all mouse input to the overlay.
+
+### 3.10 Session controller (`session.py`)
+Ordered lifecycle:
+
+1. `GET /policies/acceptable-use` -> `version`.
+2. If `DESKTOP_SESSION_ID` is set: fetch it; acknowledge it if `pending`.
+   Otherwise `POST /sessions/preflight`; blockers abort with their messages.
+3. `POST /sessions` with `kind="live"` and the acknowledged version. A `409`
+   means a session already exists, so the active one is adopted and acked.
+4. Start `/events`, wait for `connected` (≤15 s), then start `/audio`.
+5. Render deltas/finals; refetch the transcript after each final for speakers.
+6. Answers: `answer_latest()` (F10) or auto-answer when enabled. One stream per
+   question turn; a new question cancels the previous stream.
+7. Stop: `client.audio_end` -> wait for `audio.closed` (25 s cap) -> end the
+   session -> poll debrief -> fetch -> memory summary.
+8. Shutdown cancels all tasks and closes the HTTP client.
+
+Long operations (transcript refresh, answers, debrief) run as tasks so the
+events reader is never blocked.
 
 ---
 
-### 3.3 Audio Capture Pipeline (`desktop_client/audio.py`)
+## 4. Verification
 
-Produces raw audio chunks formatted precisely for the backend STT provider (AssemblyAI / Google Speech).
+### 4.1 Automated tests (`tests/`, 56 tests)
 
-#### Format Contract
-- **Sample Rate:** 16,000 Hz (16 kHz).
-- **Channels:** 1 (Mono).
-- **Data Type:** Signed 16-bit Linear PCM, Little-Endian (`int16` / S16LE).
-- **Frame Duration:** 50 ms.
-- **Samples per Frame:** $16000 \times 0.05 = 800$ samples.
-- **Bytes per Frame:** $800 \times 1 \text{ channel} \times 2 \text{ bytes/sample} = 1,600$ bytes.
+| Area | Coverage |
+|---|---|
+| Overlay / audio / stealth (19) | Flags, badges, click-through, frame size, tail padding, `aclose`, affinity mocks |
+| Config | env vs `.env` precedence, ws derivation, CLI overrides |
+| Transcript | delta replace, dedup by turn+segment, ordering, authoritative merge, relabel |
+| API/SSE | token/done parsing, idempotency header, structured 503/404 errors, memory, malformed frames |
+| Events socket | initial status + delta + final, subprotocol header, heartbeat, reconnect+resubscribe, 4401 stop, replay gap |
+| Audio socket | frame forwarding, `client.audio_end`, `audio.closed`, `audio.failed`, disconnect, finalize timeout |
+| Controller | transcript rendering, dedup, capture status, replay-gap resync, answer success/failure+retry, end→debrief→memory, generate_failed retry, session adoption/creation/preflight |
+| Live smoke (opt-in) | real backend round trip: preflight → create → events → audio → stop → end → debrief → memory |
 
-#### Thread-Safe Async Generator
-- **Engine:** `sounddevice.RawInputStream`.
-- **Bridge:** PortAudio invokes `audio_callback` on a real-time high-priority OS thread.
-- **Queue:** Bounded `asyncio.Queue` (max 40 frames ≈ 2.0 seconds of audio buffer).
-- **Backpressure Handling:** If the asyncio consumer falls behind and the queue fills up, the callback schedules queue maintenance on the event loop via `loop.call_soon_threadsafe`, drops the oldest frame, and enqueues the latest with a warning. The callback never blocks.
-- **Silence Padding:** On a graceful stop, any residual partial frame is padded with null bytes to 1,600 bytes before the generator returns. Cancellation closes the stream without yielding from `finally` (avoids `RuntimeError: async generator ignored GeneratorExit`).
-- **Environment Agility:** Uses sounddevice's normal PortAudio loader; install `libportaudio2` on Linux for real capture. `--simulate-audio` enables synthetic frames for headless verification; normal runs do not silently fall back.
-
----
-
-### 3.4 Application Lifecycle (`desktop_client/main.py`)
-
-- **Event Loop Integration:** Uses `qasync.QEventLoop` to unify the Qt GUI event loop and Python's `asyncio` event loop.
-- **Pattern:** explicit QEventLoop integration; no broad exception fallback:
-  ```python
-  loop = QEventLoop(app)
-  asyncio.set_event_loop(loop)
-  try:
-      loop.run_until_complete(async_main(app, simulate_audio=args.simulate_audio))
-  finally:
-      loop.close()
-  ```
-- **Execution Flow:**
-  1. Instantiates `OverlayWindow` and invokes `.show()`.
-  2. Spawns `stream_audio_to_overlay` async background task.
-  3. Awaits the first 1,600-byte frame and prints:
-     ```text
-     captured 1600 bytes
-     ```
-  4. Updates the overlay's partial label with streaming frame counters.
-  5. `closeEvent` emits `closed`; the async main cancels the audio task and exits. `Stop` emits `stop_requested`, ending capture gracefully (padded tail) without closing the window.
-
----
-
-## 4. Verification and Quality Assurance
-
-### 4.1 Automated Test Suite (`tests/test_desktop_client.py`)
-
-The test suite contains 19 unit tests executed using `pytest` and `pytest-asyncio`:
-
-| Component | Test Case | Target Checked | Result |
-|---|---|---|---|
-| **Stealth** | `test_stealth_enum_and_constants` | Enum values and hexadecimal flags (`0x00`, `0x01`, `0x11`) | PASS |
-| **Stealth** | `test_stealth_capability_non_windows` | Returns `UNSUPPORTED` on Linux/macOS | PASS |
-| **Stealth** | `test_stealth_apply_clear_non_windows` | Safe no-op and returns `UNSUPPORTED` on non-Windows | PASS |
-| **Stealth** | `test_stealth_capability_windows_mock` | Probes `EXCLUDED` on build 19045, `BLACK_BOX` on build 18362 | PASS |
-| **Stealth** | `test_stealth_apply_windows_success_excluded` | Calls `SetWindowDisplayAffinity(hwnd, 0x11)` successfully | PASS |
-| **Stealth** | `test_stealth_apply_windows_fallback_black_box` | Retries `0x01` upon `0x11` failure and transitions to `BLACK_BOX` | PASS |
-| **Stealth** | `test_stealth_apply_windows_both_failed` | Returns `FAILED` if both 0x11 and 0x01 fail | PASS |
-| **Stealth** | `test_stealth_clear_windows` | Verifies `clear()` sets `WDA_NONE` (`0x00`) | PASS |
-| **Overlay** | `test_overlay_creation_and_flags` | Flags: frameless, top, tool, no-focus; Attributes: translucent, no-activate | PASS |
-| **Overlay** | `test_overlay_api_methods` | Transcript, append, partial, status, model, and stealth badge updates | PASS |
-| **Overlay** | `test_overlay_click_through_toggle` | Toggles `WindowTransparentForInput` flag cleanly | PASS |
-| **Overlay** | `test_overlay_stealth_toggle` | Toggles stealth state on/off | PASS |
-| **Overlay** | `test_overlay_close_signal` | `closeEvent` emits `closed` so the app can exit | PASS |
-| **Overlay** | `test_overlay_stop_signal` | `Stop` emits `stop_requested` without closing | PASS |
-| **Overlay** | `test_overlay_stealth_disabled_badge_is_visible_to_share` | Disabled stealth reports visible-to-share | PASS |
-| **Audio** | `test_audio_constants` | Validates 16 kHz, mono, 50 ms, 800 samples, 1600 bytes, queue size 40 | PASS |
-| **Audio** | `test_mic_frames_yields_1600_byte_frames` | Verifies exact 1600-byte PCM frame generation | PASS |
-| **Audio** | `test_mic_frames_tail_padding_on_stop` | Real fake-stream test: partial tail is padded to 1600 bytes on graceful stop | PASS |
-| **Audio** | `test_mic_frames_aclose_does_not_raise` | Closing the generator does not yield from `finally` | PASS |
-
-Run command:
 ```bash
-pytest -v
-# Output: 19 passed
+QT_QPA_PLATFORM=offscreen pytest -q
+# 56 passed, 1 skipped
 ```
 
-### 4.2 CLI Verification
-Execution of the package module:
+Socket tests use real local `websockets` servers; HTTP tests use
+`httpx.MockTransport`. No backend, keys, or audio hardware required.
+
+The skipped test is `tests/test_live_smoke.py`; set `DESKTOP_LIVE_API` and
+`DESKTOP_LIVE_TOKEN` to run it against a real backend. It was verified against
+the `ai_interview` server on a disposable migrated DB: the session was created
+and ended, the acceptable-use version was acknowledged, `system.error
+stt_provider_unavailable` was surfaced (no AssemblyAI key), and the debrief
+resolved to `no_content` with `total_turns: 0`.
+
+### 4.2 Entry point
 ```bash
 python -m desktop_client.main --simulate-audio
-# Stdout verified: captured 1600 bytes
+# captured 1600 bytes
 ```
-
-Real capture requires PortAudio (`libportaudio2` on Debian/Ubuntu) and a microphone.
 
 ---
 
-## 5. Next Iteration: Full Backend Integration Roadmap
+## 5. Client-side handling of backend gaps
 
-When moving from the skeleton to the live session flow, the following contracts are to be connected:
+| Gap | Client behavior |
+|---|---|
+| No `speaker` on transcript events | Assume candidate, then relabel from `GET /transcript` after each final |
+| Finals default to `speaker="candidate"` | `DESKTOP_AUTO_ANSWER` defaults off; F10 is the deliberate trigger |
+| No audio-format negotiation | Assumes 16 kHz S16LE mono 50 ms; documented as an assumption |
+| No `/audio` source parameter | Sends `?source=mic`; harmless today, ready for the backend change |
 
-```
-+-----------------------------------------------------------------------------------------+
-|                                    Client Overlay                                       |
-+-----------------------------------------------------------------------------------------+
-       |                                      |                                   ^
- 1. WS Connect (Subscribe)              2. Binary Audio Chunks              SSE Answer Tokens
-       |                                      |                                   |
-       v                                      v                                   |
-+--------------------------+        +--------------------------+        +--------------------------+
-| WS /sessions/{id}/events |        | WS /sessions/{id}/audio  |        | POST /practice/answer    |
-+--------------------------+        +--------------------------+        +--------------------------+
-| - session.status_changed |        | - Raw PCM S16LE (1.6KB)  |        | Body:                    |
-| - speech.transcript_delta|        | - {"type":"client.       |        |  {question_turn_id,      |
-| - speech.transcript_final|        |     audio_end"}          |        |   candidate_turn_id}     |
-| - client.heartbeat (20s) |        | Receives: audio.closed   |        | Receives: answer_token   |
-+--------------------------+        +--------------------------+        +--------------------------+
-```
+---
 
-### Connection Sequence
-1. **Preflight & Session Setup:**
-   - `GET /api/v1/policies/acceptable-use` → read `version`.
-   - `POST /api/v1/sessions` with `kind: "live"` and `acknowledged_policy_version`.
-2. **WebSocket Order:**
-   - **First:** Connect `WS /api/v1/sessions/{id}/events` (with `Sec-WebSocket-Protocol: bearer.<jwt>`). Consume the initial `session.status_changed` snapshot.
-   - **Second:** Connect `WS /api/v1/sessions/{id}/audio` and begin streaming the 1,600-byte frames generated by `audio.mic_frames()`.
-3. **Heartbeats:**
-   - Emit `{"type": "client.heartbeat"}` every 15–20 seconds on `/events` (server drops connection after 65 seconds of silence).
-4. **Live Turn Delivery & Answers:**
-   - On `speech.transcript_delta` → update `overlay.set_partial(delta_text)`.
-   - On `speech.transcript_final` → append finalized text with `turn_id` via `overlay.append_transcript(final_text)`.
-   - POST `turn_id` to `/api/v1/sessions/{id}/practice/answer` to stream live answers via Server-Sent Events (SSE).
-5. **Teardown & Debrief:**
-   - Send `{"type": "client.audio_end"}` on `/audio` and wait for `audio.closed`.
-   - Call `POST /api/v1/sessions/{id}/end` to initiate debrief and memory persistence.
+## 6. What is intentionally not here
+
+- No packaging/installer (PyInstaller/uv decision still open).
+- No TTS.
+- No loopback/system-audio capture — mic only.
+- No stealth verification record; the §10.6 matrix needs the target hardware.
