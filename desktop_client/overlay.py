@@ -10,10 +10,9 @@ Implements PySide6 QWidget overlay with:
 """
 
 import math
-import sys
 from typing import Optional
 
-from PySide6.QtCore import QPoint, Qt, QTimer
+from PySide6.QtCore import QPoint, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -66,6 +65,9 @@ class PulsingDot(QWidget):
 
 class OverlayWindow(QWidget):
     """Translucent always-on-top overlay for live transcript display."""
+
+    closed = Signal()
+    stop_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -212,8 +214,9 @@ class OverlayWindow(QWidget):
 
         main_layout.addLayout(self.controls_layout)
 
-        # Initial stealth probe/badge update
-        self.set_stealth_state(stealth.capability())
+        # Badge starts as capture-visible; showEvent() applies the real
+        # affinity and updates the badge from the API result.
+        self.set_stealth_state(StealthState.UNSUPPORTED)
 
     def _setup_shortcuts(self):
         """Hardcoded keyboard shortcuts for skeleton iteration.
@@ -261,11 +264,8 @@ class OverlayWindow(QWidget):
             self.set_stealth_state(state)
         else:
             stealth.clear(self)
-            # If disabled manually, show status based on platform capability
-            if sys.platform == "win32":
-                self.set_stealth_state(StealthState.FAILED)
-            else:
-                self.set_stealth_state(StealthState.UNSUPPORTED)
+            # Manually disabled means capture-visible, not an API failure.
+            self.set_stealth_state(StealthState.UNSUPPORTED)
 
     def toggle_stealth(self):
         """Toggle stealth exclusion on/off."""
@@ -374,7 +374,13 @@ class OverlayWindow(QWidget):
         )
         self.update()
 
+    def closeEvent(self, event):
+        """Notify the owner before the overlay hides."""
+        self.closed.emit()
+        super().closeEvent(event)
+
     def on_stop_clicked(self):
-        """Stop button handler."""
-        self.set_status("stopped")
-        self.set_partial("Capture stopped.")
+        """Request a graceful audio stop; the window stays open."""
+        self.set_status("stopping")
+        self.set_partial("Capture stopping...")
+        self.stop_requested.emit()

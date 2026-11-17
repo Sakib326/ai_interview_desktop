@@ -298,21 +298,76 @@ async def test_mic_frames_yields_1600_byte_frames():
         assert len(f) == 1600
 
 
+class _FakeAudioStream:
+    def __init__(self, callback, **kwargs):
+        self.callback = callback
+
+    def start(self):
+        # One full 50 ms frame plus a 1,000-byte partial tail.
+        self.callback(b"\x00" * 1600 + b"\x01" * 1000, 2600, None, None)
+
+    def stop(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakeSoundDevice:
+    @staticmethod
+    def RawInputStream(**kwargs):
+        return _FakeAudioStream(**kwargs)
+
+
 @pytest.mark.asyncio
-async def test_audio_tail_padding_on_stop():
-    """Verify that when audio stream ends with partial tail, it is padded with silence."""
-    # Test manual padding logic
-    expected_bytes = 1600
-    tail_buffer = bytearray(b"\x01\x02" * 500)  # 1000 bytes (partial frame)
-    assert len(tail_buffer) == 1000
+async def test_mic_frames_tail_padding_on_stop(monkeypatch):
+    monkeypatch.setitem(sys.modules, "sounddevice", _FakeSoundDevice)
+    stop = asyncio.Event()
+    frames = []
+    async for frame in mic_frames(allow_simulation_fallback=False, stop_event=stop):
+        frames.append(frame)
+        if len(frames) == 1:
+            stop.set()
 
-    remainder = len(tail_buffer) % expected_bytes
-    assert remainder == 1000
-    padding = b"\x00" * (expected_bytes - remainder)
-    tail_buffer.extend(padding)
+    assert len(frames) == 2
+    assert all(len(frame) == 1600 for frame in frames)
+    assert frames[1][:1000] == b"\x01" * 1000
+    assert frames[1][1000:] == b"\x00" * 600
 
-    assert len(tail_buffer) == 1600
-    padded_frame = bytes(tail_buffer)
-    assert len(padded_frame) == 1600
-    assert padded_frame[:1000] == b"\x01\x02" * 500
-    assert padded_frame[1000:] == b"\x00" * 600
+
+@pytest.mark.asyncio
+async def test_mic_frames_aclose_does_not_raise(monkeypatch):
+    monkeypatch.setitem(sys.modules, "sounddevice", _FakeSoundDevice)
+    agen = mic_frames(allow_simulation_fallback=False)
+    first = await anext(agen)
+    assert len(first) == 1600
+    await agen.aclose()  # must not raise "async generator ignored GeneratorExit"
+
+
+def test_overlay_close_signal(qapp):
+    overlay = OverlayWindow()
+    overlay.show()
+    closed = []
+    overlay.closed.connect(lambda: closed.append(True))
+    overlay.close()
+    qapp.processEvents()
+    assert closed
+
+
+def test_overlay_stop_signal(qapp):
+    overlay = OverlayWindow()
+    stopped = []
+    overlay.stop_requested.connect(lambda: stopped.append(True))
+    overlay.on_stop_clicked()
+    assert stopped
+    assert overlay.status_label.text() == "stopping"
+    assert overlay.partial_label.text() == "Capture stopping..."
+
+
+def test_overlay_stealth_disabled_badge_is_visible_to_share(qapp):
+    overlay = OverlayWindow()
+    overlay.show()
+    overlay.toggle_stealth()  # default ON -> OFF
+    assert overlay.stealth_badge.text() == "visible to share"
+    overlay.toggle_stealth()
+    overlay.close()

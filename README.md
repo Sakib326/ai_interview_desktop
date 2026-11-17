@@ -4,8 +4,8 @@ Skeleton implementation of the desktop client overlay with microphone capture an
 
 ## Scope
 - UI overlay: Frameless, translucent, always-on-top, non-activating window with pulsing recording dot, transcript turns, partials, and stealth status badge.
-- Audio capture: 50 ms PCM S16LE 16 kHz mono frames (1,600 bytes) via `sounddevice.RawInputStream` and bounded async queue.
-- Windows stealth: Screen share / capture exclusion via `SetWindowDisplayAffinity` (`WDA_EXCLUDEFROMCAPTURE` / `WDA_MONITOR`), strictly decoupled from click-through.
+- Audio capture: 50 ms PCM S16LE 16 kHz mono frames (1,600 bytes) via `sounddevice.RawInputStream` and a bounded async queue. Real capture needs PortAudio; `--simulate-audio` is opt-in for headless verification.
+- Windows stealth: best-effort screen share / capture exclusion via `SetWindowDisplayAffinity` (`WDA_EXCLUDEFROMCAPTURE` / `WDA_MONITOR`), strictly decoupled from click-through. Not a guarantee; see `initialize-plan.md` §10.
 - Zero business logic, zero backend changes.
 
 ---
@@ -45,14 +45,27 @@ tests/
 ## Running and Verification
 
 ### 1. Run the client
+
+Real capture requires PortAudio and a microphone. On Debian/Ubuntu:
+`sudo apt install libportaudio2`.
+
 ```bash
 python -m desktop_client.main
 ```
-The client prints `captured 1600 bytes` at least once upon receiving the first 50 ms audio frame and streams updates to the overlay.
+
+Headless or device-less verification uses opt-in synthetic frames:
+
+```bash
+python -m desktop_client.main --simulate-audio
+```
+
+The client prints `captured 1600 bytes` at least once upon receiving the first
+50 ms audio frame. `Stop` ends capture gracefully; `Close` exits the app.
 
 ### 2. Run unit tests
 ```bash
 pytest -v
+# 19 passed
 ```
 
 ### 3. Verification Checklist
