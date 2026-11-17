@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "desktop_client"
+version = "0.1.0"
+description = "PySide6 Live Overlay with Microphone Capture and Windows Capture Exclusion"
+authors = [{ name = "Desktop Team" }]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.5.0",
+    "qasync>=0.27.0",
+    "sounddevice>=0.4.6",
+]
+
+[project.scripts]
+desktop-client = "desktop_client.main:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

@@ -1,0 +1,2 @@
+[console_scripts]
+desktop-client = desktop_client.main:main
