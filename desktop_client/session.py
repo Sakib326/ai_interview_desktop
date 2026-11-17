@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from typing import Any, Dict, Optional
 
 from desktop_client.api import ApiClient, ApiError
 from desktop_client.audio import mic_frames
 from desktop_client.audio_ws import AudioOutcome, AudioSender
-from desktop_client.config import Settings
+from desktop_client.config import AUDIO_SOURCES, Settings
 from desktop_client.events import (
     DEBRIEF_STATUS_CHANGED,
     SESSION_STATUS_CHANGED,
@@ -34,13 +35,14 @@ from desktop_client.events import (
     EventClient,
     ServerEvent,
 )
-from desktop_client.transcript import TranscriptStore
+from desktop_client.transcript import SPEAKER_INTERVIEWER, TranscriptStore
 
 logger = logging.getLogger(__name__)
 
 DEBRIEF_POLL_SECONDS = 2.0
 DEBRIEF_TIMEOUT_SECONDS = 120.0
 AUDIO_FINALIZE_WAIT_SECONDS = 25.0
+AUDIO_RETRY_DELAY_SECONDS = 1.0
 
 
 class SessionError(Exception):
@@ -66,20 +68,37 @@ class LiveSessionController:
         self._events_task: Optional[asyncio.Task] = None
         self._audio_task: Optional[asyncio.Task] = None
         self._answer_task: Optional[asyncio.Task] = None
+        self._token_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._events_ready = asyncio.Event()
         self._closing = False
         self._stopping = False
+        self._ended = False
+        self.preflight_warnings: list = []
         self.audio_outcome: Optional[AudioOutcome] = None
         self._answered_turns: set = set()
         self._retry_handler = None
+        # Backend caches create responses per (user, key) for the process
+        # lifetime, so the key must be unique per launch attempt. A constant key
+        # would replay the first session of the process (already ended) forever.
+        self._create_idempotency_key = f"desktop-{uuid.uuid4()}"
 
         self.overlay.retry_requested.connect(self._on_retry_clicked)
+
+    @property
+    def answered_turn_ids(self) -> set:
+        """Question turns already answered or explicitly skipped by the gate."""
+        return set(self._answered_turns)
 
     # --------------------------------------------------------------- lifecycle
     async def start(self) -> None:
         if not self.settings.configured:
             raise SessionError("DESKTOP_ACCESS_TOKEN is required for a live session")
+        if self.settings.audio_source not in AUDIO_SOURCES:
+            raise SessionError(
+                f"Unknown audio source {self.settings.audio_source!r}; "
+                f"expected one of {sorted(AUDIO_SOURCES)}"
+            )
 
         session = await self._ensure_session()
         self.session_id = session["id"]
@@ -94,11 +113,15 @@ class LiveSessionController:
             self._on_event,
             on_replay_gap=self._on_replay_gap,
             on_state_change=self._on_events_state,
+            on_auth_expired=self.api.refresh_token,
         )
         self._events_task = asyncio.create_task(
             self._events.run(), name="events"
         )
         self._audio_task = asyncio.create_task(self._run_audio(), name="audio")
+        self._token_task = asyncio.create_task(
+            self._maintain_token(), name="token-refresh"
+        )
 
     async def stop(self) -> None:
         """Graceful stop: flush audio, then end the session and fetch debrief."""
@@ -120,10 +143,29 @@ class LiveSessionController:
             except Exception:
                 logger.exception("Audio task failed")
 
+        # A final emitted during the audio flush can start an answer. Let it
+        # finish before ending the session, or the answer races the end (409).
+        if self.settings.auto_answer and self._answer_task is None:
+            deadline = asyncio.get_running_loop().time() + 3.0
+            while (
+                self._answer_task is None
+                and asyncio.get_running_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.05)
+        if self._answer_task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(self._answer_task), 20.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            except Exception:
+                logger.exception("Last answer failed during stop")
+
+        # Keep /events open through session end so the terminal
+        # session.status_changed and debrief.status_changed still arrive.
+        await self._end_and_debrief()
+
         if self._events is not None:
             await self._events.stop()
-
-        await self._end_and_debrief()
 
     async def shutdown(self) -> None:
         """Cancel everything. Safe to call multiple times."""
@@ -132,7 +174,33 @@ class LiveSessionController:
         self._closing = True
         self._stop_event.set()
 
-        for task in (self._answer_task, self._audio_task, self._events_task):
+        # Closing the window is a cancellation, not a Stop: audio is not
+        # flushed. Still end the session so it does not stay 'active' and get
+        # adopted by the next launch.
+        if (
+            self.session_id
+            and not self._ended
+            and not self._stopping
+            and not self.settings.session_id
+        ):
+            try:
+                await asyncio.wait_for(
+                    self.api.end_session(
+                        self.session_id,
+                        idempotency_key=f"end-{self.session_id}",
+                    ),
+                    5.0,
+                )
+                self._ended = True
+            except (asyncio.TimeoutError, ApiError) as exc:
+                logger.warning("Session end on shutdown failed: %s", exc)
+
+        for task in (
+            self._answer_task,
+            self._audio_task,
+            self._events_task,
+            self._token_task,
+        ):
             if task is not None and not task.done():
                 task.cancel()
                 try:
@@ -142,6 +210,17 @@ class LiveSessionController:
 
         if self.api is not None:
             await self.api.aclose()
+
+    async def _maintain_token(self) -> None:
+        """Refresh the access token shortly before it expires."""
+        while True:
+            await asyncio.sleep(30.0)
+            try:
+                await self.api.ensure_fresh_token(within_seconds=90.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("Token maintenance failed: %s", exc)
 
     async def close(self) -> None:
         await self.shutdown()
@@ -156,6 +235,20 @@ class LiveSessionController:
         version = policy.get("version")
         if not version:
             raise SessionError("Backend did not return an acceptable-use version")
+
+        # Preflight is also the only pre-session source of the resolved provider
+        # model and non-blocking warnings, so run it in both paths.
+        try:
+            preflight = await self.api.preflight(
+                kind="live",
+                acknowledged_policy_version=version,
+                goal_id=self.settings.goal_id or None,
+            )
+        except ApiError as exc:
+            if not self.settings.session_id:
+                raise SessionError(f"Preflight failed: {exc}") from exc
+            preflight = {}
+        self._apply_preflight(preflight)
 
         if self.settings.session_id:
             session = await self.api.get_session(self.settings.session_id)
@@ -173,11 +266,6 @@ class LiveSessionController:
                 )
             return session
 
-        preflight = await self.api.preflight(
-            kind="live",
-            acknowledged_policy_version=version,
-            goal_id=self.settings.goal_id or None,
-        )
         if not preflight.get("can_start", False):
             blockers = "; ".join(
                 issue.get("message", issue.get("code", "blocker"))
@@ -190,7 +278,7 @@ class LiveSessionController:
                 kind="live",
                 acknowledged_policy_version=version,
                 goal_id=self.settings.goal_id or None,
-                idempotency_key=f"desktop-{version}",
+                idempotency_key=self._create_idempotency_key,
             )
         except ApiError as exc:
             if exc.status_code != 409:
@@ -204,6 +292,24 @@ class LiveSessionController:
                 session = await self.api.get_session(session["id"])
             return session
 
+    def _apply_preflight(self, preflight: Dict[str, Any]) -> None:
+        """Take the resolved model and non-blocking warnings from preflight."""
+        warnings = [
+            str(issue.get("message") or issue.get("code"))
+            for issue in preflight.get("warnings", [])
+            if isinstance(issue, dict)
+        ]
+        self.preflight_warnings = warnings
+        for message in warnings:
+            logger.warning("Preflight warning: %s", message)
+
+        providers = (preflight.get("policies") or {}).get("providers") or {}
+        llm = providers.get("llm") or {}
+        answer = llm.get("answer_generation") or {}
+        model = answer.get("model") or (llm.get("llm") or {}).get("model")
+        if model:
+            self.overlay.set_model(str(model))
+
     # ------------------------------------------------------------------- audio
     async def _run_audio(self) -> None:
         try:
@@ -211,19 +317,39 @@ class LiveSessionController:
         except asyncio.TimeoutError:
             logger.warning("Events socket not ready; starting audio anyway")
 
-        sender = AudioSender(
-            self.settings,
-            self.session_id or "",
-            on_state_change=self._on_audio_state,
-        )
-        frames = mic_frames(
-            allow_simulation_fallback=self.settings.simulate_audio,
-            stop_event=self._stop_event,
-        )
-        try:
-            self.audio_outcome = await sender.run(frames)
-        finally:
-            await frames.aclose()
+        attempt = 0
+        while True:
+            sender = AudioSender(
+                self.settings,
+                self.session_id or "",
+                on_state_change=self._on_audio_state,
+            )
+            frames = mic_frames(
+                allow_simulation_fallback=self.settings.simulate_audio,
+                stop_event=self._stop_event,
+            )
+            try:
+                self.audio_outcome = await sender.run(frames)
+            finally:
+                await frames.aclose()
+
+            outcome = self.audio_outcome
+            if outcome is None:
+                return
+
+            retryable = (
+                outcome.status == "disconnected"
+                or (outcome.status == "failed" and outcome.retryable)
+            )
+            if not retryable or attempt >= 1 or self._stop_event.is_set():
+                break
+
+            # One automatic restart for a transient provider/network failure.
+            attempt += 1
+            logger.warning("Restarting audio stream after %s", outcome.status)
+            self.overlay.set_status("reconnecting audio")
+            await self.api.ensure_fresh_token(force=True)
+            await asyncio.sleep(AUDIO_RETRY_DELAY_SECONDS)
 
         outcome = self.audio_outcome
         if outcome is None:
@@ -236,6 +362,11 @@ class LiveSessionController:
         elif outcome.status == "closed":
             self.overlay.set_status("stopped")
             self.overlay.set_partial("Audio closed by backend.")
+        elif outcome.status == "disconnected":
+            self.overlay.set_status("audio disconnected")
+            self.overlay.set_partial(
+                "Audio stream dropped; press Stop to end or restart the client."
+            )
 
     # ------------------------------------------------------------------ events
     async def _on_event(self, event: ServerEvent) -> None:
@@ -258,16 +389,26 @@ class LiveSessionController:
             turn = self.transcript.apply_final(payload)
             if turn is not None:
                 self._render_transcript()
-                asyncio.create_task(self._refresh_speakers())
-                if self.settings.auto_answer:
-                    self.answer_latest()
+                if not payload.get("speaker"):
+                    # Older backends omit speaker; fall back to the transcript.
+                    asyncio.create_task(self._refresh_speakers())
+                if (
+                    self.settings.auto_answer
+                    and turn.speaker == SPEAKER_INTERVIEWER
+                ):
+                    # Gated path: the Turn Gate decides whether to answer.
+                    self._start_answer(
+                        turn.turn_id,
+                        self.transcript.candidate_turn_id_before(turn.sequence_number),
+                        gated=True,
+                    )
 
         elif kind == TRANSCRIPT_ERROR:
             message = payload.get("message") or "transcription failed"
-            retryable = bool(payload.get("retryable", False))
-            self.overlay.set_answer_error(
-                f"{message} ({payload.get('error_class', 'error')})", retryable
-            )
+            error_class = payload.get("error_class", "error")
+            # This is a capture-path problem, not an answer failure.
+            self.overlay.set_status("transcription error")
+            self.overlay.set_partial(f"{message} ({error_class})")
 
         elif kind == ARTIFACT_EXTRACTED:
             title = payload.get("title") or payload.get("artifact_type")
@@ -294,6 +435,8 @@ class LiveSessionController:
         if state == "connected":
             self._events_ready.set()
             self.overlay.set_status("listening")
+            if self.preflight_warnings:
+                self.overlay.set_partial(self.preflight_warnings[0])
         elif state == "reconnecting":
             self.overlay.set_status("reconnecting")
         elif state == "unauthorized":
@@ -330,25 +473,47 @@ class LiveSessionController:
 
     # ----------------------------------------------------------------- answers
     def answer_latest(self) -> None:
-        turn_id = self.transcript.latest_turn_id
-        if not turn_id or turn_id in self._answered_turns:
+        """Manual (F10) answer: prefer the interviewer's latest question."""
+        turn = (
+            self.transcript.latest_turn(SPEAKER_INTERVIEWER)
+            or self.transcript.latest_turn()
+        )
+        if turn is None or turn.turn_id in self._answered_turns:
             return
-        self._start_answer(turn_id, self.transcript.candidate_turn_id())
+        self._start_answer(
+            turn.turn_id,
+            self.transcript.candidate_turn_id_before(turn.sequence_number),
+            gated=False,
+        )
 
-    def _start_answer(self, question_turn_id: str, candidate_turn_id: Optional[str]) -> None:
+    def _start_answer(
+        self,
+        question_turn_id: str,
+        candidate_turn_id: Optional[str],
+        *,
+        gated: bool = False,
+    ) -> None:
         if self._answer_task is not None and not self._answer_task.done():
             self._answer_task.cancel()
         self._answer_task = asyncio.create_task(
-            self._stream_answer(question_turn_id, candidate_turn_id),
+            self._stream_answer(question_turn_id, candidate_turn_id, gated),
             name="answer",
         )
 
-    async def _stream_answer(self, question_turn_id: str, candidate_turn_id: Optional[str]) -> None:
+    async def _stream_answer(
+        self,
+        question_turn_id: str,
+        candidate_turn_id: Optional[str],
+        gated: bool = False,
+    ) -> None:
         self.overlay.set_answer_loading()
         accumulated = []
         try:
             async for event_type, envelope in self.api.answer(
-                self.session_id or "", question_turn_id, candidate_turn_id
+                self.session_id or "",
+                question_turn_id,
+                candidate_turn_id,
+                gated=gated,
             ):
                 payload = envelope.get("payload", envelope)
                 if event_type == "assistant.answer_token":
@@ -363,6 +528,13 @@ class LiveSessionController:
                     self._answered_turns.add(question_turn_id)
                     self._retry_handler = None
                     self.overlay.retry_btn.hide()
+                elif event_type == "assistant.answer_skipped":
+                    # The Turn Gate declined: not an error, and nothing to show.
+                    reason = payload.get("reason") or payload.get("decision") or "skipped"
+                    self._answered_turns.add(question_turn_id)
+                    self._retry_handler = None
+                    self.overlay.clear_answer()
+                    self.overlay.set_partial(f"answer skipped: {reason}")
                 elif event_type == "assistant.answer_failed":
                     message = str(
                         payload.get("partial_text")
@@ -371,7 +543,9 @@ class LiveSessionController:
                     )
                     self._set_retry(
                         bool(payload.get("retryable", False)),
-                        lambda: self._start_answer(question_turn_id, candidate_turn_id),
+                        lambda: self._start_answer(
+                            question_turn_id, candidate_turn_id, gated=gated
+                        ),
                     )
                     self.overlay.set_answer_error(
                         message, bool(payload.get("retryable", False))
@@ -381,7 +555,9 @@ class LiveSessionController:
         except ApiError as exc:
             self._set_retry(
                 exc.retryable,
-                lambda: self._start_answer(question_turn_id, candidate_turn_id),
+                lambda: self._start_answer(
+                    question_turn_id, candidate_turn_id, gated=gated
+                ),
             )
             self.overlay.set_answer_error(f"{exc.code}: {exc.message}", exc.retryable)
 
@@ -404,6 +580,7 @@ class LiveSessionController:
             await self.api.end_session(
                 self.session_id, idempotency_key=f"end-{self.session_id}"
             )
+            self._ended = True
         except ApiError as exc:
             logger.warning("Session end failed: %s", exc)
             self.overlay.set_partial(f"End failed: {exc}")
@@ -491,3 +668,25 @@ class LiveSessionController:
         items = data.get("items") or []
         total = data.get("total", len(items))
         self.overlay.set_partial(f"memory: {total} item(s)")
+
+    # ------------------------------------------------------------ memory actions
+    async def forget_all_memory(self) -> None:
+        """Erase every stored memory item. Sessions and debriefs are untouched."""
+        try:
+            await self.api.clear_memory()
+        except ApiError as exc:
+            self.overlay.set_partial(f"Memory erase failed: {exc.message}")
+            return
+        self.overlay.set_partial("memory erased")
+
+    async def retry_memory(self) -> None:
+        """Re-enqueue extraction for the current session's ready debrief."""
+        if not self.session_id:
+            self.overlay.set_partial("No session to retry memory for.")
+            return
+        try:
+            await self.api.retry_memory(self.session_id)
+        except ApiError as exc:
+            self.overlay.set_partial(f"Memory retry failed: {exc.message}")
+            return
+        self.overlay.set_partial("memory extraction queued")

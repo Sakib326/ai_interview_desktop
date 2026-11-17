@@ -16,7 +16,7 @@ import asyncio
 import logging
 import sys
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 from qasync import QEventLoop
 
 from desktop_client.audio import mic_frames
@@ -32,6 +32,20 @@ logging.basicConfig(
 logger = logging.getLogger("desktop_client.main")
 
 VK_F10 = 0x79
+
+
+def _confirm_forget_memory(controller) -> None:
+    """Ask before the one destructive memory action."""
+    choice = QMessageBox.question(
+        None,
+        "Erase memory",
+        "Delete all stored memory for this account?\n"
+        "Sessions and debriefs are kept.",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No,
+    )
+    if choice == QMessageBox.StandardButton.Yes:
+        asyncio.create_task(controller.forget_all_memory())
 
 
 async def stream_audio_to_overlay(
@@ -128,7 +142,16 @@ async def async_main(app: QApplication, settings: Settings, *, use_tray: bool = 
 
     tray = None
     if use_tray:
-        tray = TrayIcon(overlay, on_quit=overlay.close)
+        extra_actions = []
+        if controller is not None:
+            extra_actions = [
+                ("Forget all memory\u2026", lambda: _confirm_forget_memory(controller)),
+                (
+                    "Retry memory extraction",
+                    lambda: asyncio.create_task(controller.retry_memory()),
+                ),
+            ]
+        tray = TrayIcon(overlay, on_quit=overlay.close, extra_actions=extra_actions)
         tray.show()
 
     try:

@@ -209,3 +209,109 @@ async def test_parse_sse_ignores_comments_and_malformed_frames():
 
     frames = [frame async for frame in parse_sse_stream(lines())]
     assert frames == [("ping", {"ok": True})]
+
+
+@pytest.mark.asyncio
+async def test_expired_access_token_is_refreshed_and_retried():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.endswith("/auth/refresh"):
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "new-token",
+                    "refresh_token": "rotated",
+                    "token_type": "bearer",
+                    "expires_in": 3600,
+                    "user_id": "u1",
+                    "email": "a@b.c",
+                    "display_name": "A",
+                    "device_id": "dev-1",
+                },
+            )
+        if request.headers.get("authorization") != "Bearer new-token":
+            return httpx.Response(401, json={"detail": "expired"})
+        return httpx.Response(200, json={"version": "2026-11"})
+
+    settings = Settings(
+        api_base_url="http://backend.test",
+        access_token="stale-token",
+        refresh_token="refresh-1",
+        device_id="dev-1",
+    )
+    client = ApiClient(settings, transport=httpx.MockTransport(handler))
+    try:
+        data = await client.acceptable_use()
+    finally:
+        await client.aclose()
+
+    assert data["version"] == "2026-11"
+    assert settings.access_token == "new-token"
+    assert settings.refresh_token == "rotated"
+    assert calls == [
+        "/api/v1/policies/acceptable-use",
+        "/api/v1/auth/refresh",
+        "/api/v1/policies/acceptable-use",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gated_answer_uses_live_endpoint_and_separate_key():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["idempotency"] = request.headers.get("Idempotency-Key")
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=sse_body(
+                [
+                    (
+                        "assistant.answer_skipped",
+                        {
+                            "payload": {
+                                "turn_id": "q1",
+                                "answer_status": "skipped",
+                                "decision": "silent",
+                                "intent": "filler",
+                                "reason": "greeting_or_filler",
+                            }
+                        },
+                    )
+                ]
+            ),
+        )
+
+    client = ApiClient(make_settings(), transport=httpx.MockTransport(handler))
+    try:
+        events = [
+            (event_type, envelope["payload"])
+            async for event_type, envelope in client.answer("s1", "q1", gated=True)
+        ]
+    finally:
+        await client.aclose()
+
+    assert captured["path"] == "/api/v1/sessions/s1/live/answer"
+    assert captured["idempotency"] == "live-answer-q1"
+    assert events[0][0] == "assistant.answer_skipped"
+    assert events[0][1]["reason"] == "greeting_or_filler"
+
+
+@pytest.mark.asyncio
+async def test_401_without_refresh_credentials_raises():
+    client = ApiClient(
+        make_settings(),
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(401, json={"detail": "expired"})
+        ),
+    )
+    try:
+        with pytest.raises(ApiError) as excinfo:
+            await client.acceptable_use()
+    finally:
+        await client.aclose()
+    assert excinfo.value.status_code == 401
+    assert excinfo.value.code == "unauthorized"

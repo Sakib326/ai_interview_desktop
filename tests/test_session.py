@@ -29,6 +29,7 @@ class FakeApi:
         self.created = None
         self.acknowledged = []
         self.transcript_turns = []
+        self.transcript_calls = 0
         self.answer_events = []
         self.answer_calls = []
         self.debrief_status_value = "ready"
@@ -45,7 +46,18 @@ class FakeApi:
         self.memories = {"items": [{}, {}], "total": 2}
         self.ended = 0
         self.retried_debrief = 0
+        self.cleared_memory = 0
+        self.retried_memory = 0
+        self.refreshed = 0
         self.closed = False
+
+    async def refresh_token(self):
+        self.refreshed += 1
+        return False
+
+    async def ensure_fresh_token(self, within_seconds=120.0, force=False):
+        self.refreshed += 1
+        return False
 
     async def acceptable_use(self):
         return {"version": self.version}
@@ -74,10 +86,12 @@ class FakeApi:
         return self.session
 
     async def transcript(self, session_id):
+        self.transcript_calls += 1
         return self.transcript_turns
 
-    async def answer(self, session_id, question_turn_id, candidate_turn_id=None):
-        self.answer_calls.append((question_turn_id, candidate_turn_id))
+    async def answer(self, session_id, question_turn_id, candidate_turn_id=None,
+                     *, gated=False):
+        self.answer_calls.append((question_turn_id, candidate_turn_id, gated))
         for event in self.answer_events:
             yield event
 
@@ -97,6 +111,12 @@ class FakeApi:
 
     async def list_memory(self, limit=50, offset=0):
         return self.memories
+
+    async def clear_memory(self):
+        self.cleared_memory += 1
+
+    async def retry_memory(self, session_id):
+        self.retried_memory += 1
 
     async def aclose(self):
         self.closed = True
@@ -223,7 +243,7 @@ async def test_answer_stream_renders_tokens_and_final_text(qapp):
     controller._start_answer("q1", "c1")
     await controller._answer_task
 
-    assert api.answer_calls == [("q1", "c1")]
+    assert api.answer_calls == [("q1", "c1", False)]
     assert overlay.answer_edit.toPlainText() == "Use STAR. Then metrics."
     assert overlay.retry_btn.isHidden()
 
@@ -311,7 +331,23 @@ async def test_ensure_session_creates_with_policy_version(qapp):
 
     assert api.created["kind"] == "live"
     assert api.created["ack"] == "2026-11"
-    assert api.created["key"] == "desktop-2026-11"
+    # The backend caches create responses per (user, key) for the process
+    # lifetime, so the key must not be reused across launches.
+    assert api.created["key"].startswith("desktop-")
+    assert api.created["key"] != "desktop-2026-11"
+
+
+@pytest.mark.asyncio
+async def test_create_idempotency_key_is_unique_per_controller(qapp):
+    api_one = FakeApi()
+    api_two = FakeApi()
+    first, _ = make_controller(qapp, api_one)
+    second, _ = make_controller(qapp, api_two)
+
+    await first._ensure_session()
+    await second._ensure_session()
+
+    assert api_one.created["key"] != api_two.created["key"]
 
 
 @pytest.mark.asyncio
@@ -326,3 +362,277 @@ async def test_ensure_session_raises_on_preflight_blockers(qapp):
     with pytest.raises(SessionError) as excinfo:
         await controller._ensure_session()
     assert "ack required" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_preflight_applies_model_and_surfaces_warnings(qapp):
+    api = FakeApi()
+    api.preflight_result = {
+        "can_start": True,
+        "blockers": [],
+        "warnings": [
+            {"code": "headphone_check_recommended", "message": "Use headphones"}
+        ],
+        "policies": {
+            "providers": {
+                "llm": {"answer_generation": {"model": "openai/gpt-4o-mini"}}
+            }
+        },
+    }
+    controller, overlay = make_controller(qapp, api)
+
+    await controller._ensure_session()
+
+    assert controller.preflight_warnings == ["Use headphones"]
+    assert overlay.model_label.text() == "openai/gpt-4o-mini"
+
+    # The warning is shown once the socket is up, before any transcript text.
+    controller._on_events_state("connected")
+    assert overlay.partial_label.text() == "Use headphones"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_ends_an_active_session(qapp):
+    api = FakeApi()
+    controller, _ = make_controller(qapp, api)
+    controller.session_id = "s1"
+
+    await controller.shutdown()
+
+    assert api.ended == 1
+    assert api.closed is True
+
+
+@pytest.mark.asyncio
+async def test_shutdown_does_not_end_a_reused_session(qapp):
+    api = FakeApi()
+    controller, _ = make_controller(qapp, api, session_id="s1")
+    controller.session_id = "s1"
+
+    await controller.shutdown()
+
+    # Reusing someone else's/pre-existing session must not end it on quit.
+    assert api.ended == 0
+
+
+@pytest.mark.asyncio
+async def test_audio_restarts_once_after_disconnect(qapp, monkeypatch):
+    import desktop_client.session as session_module
+    from desktop_client.audio_ws import AudioOutcome
+
+    api = FakeApi()
+    controller, overlay = make_controller(qapp, api)
+    controller.session_id = "s1"
+    controller._events_ready.set()
+
+    calls = []
+
+    class _Sender:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def run(self, frames):
+            calls.append(1)
+            if len(calls) == 1:
+                return AudioOutcome("disconnected", message="drop")
+            return AudioOutcome("closed")
+
+    async def _frames(**kwargs):
+        if False:  # pragma: no cover - empty async generator
+            yield b""
+
+    monkeypatch.setattr(session_module, "AudioSender", _Sender)
+    monkeypatch.setattr(session_module, "mic_frames", _frames)
+    monkeypatch.setattr(session_module, "AUDIO_RETRY_DELAY_SECONDS", 0)
+
+    await controller._run_audio()
+
+    assert len(calls) == 2
+    assert overlay.status_label.text() == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_audio_does_not_restart_after_user_stop(qapp, monkeypatch):
+    import desktop_client.session as session_module
+    from desktop_client.audio_ws import AudioOutcome
+
+    api = FakeApi()
+    controller, _ = make_controller(qapp, api)
+    controller.session_id = "s1"
+    controller._events_ready.set()
+    controller._stop_event.set()
+
+    calls = []
+
+    class _Sender:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def run(self, frames):
+            calls.append(1)
+            return AudioOutcome("disconnected")
+
+    async def _frames(**kwargs):
+        if False:  # pragma: no cover
+            yield b""
+
+    monkeypatch.setattr(session_module, "AudioSender", _Sender)
+    monkeypatch.setattr(session_module, "mic_frames", _frames)
+
+    await controller._run_audio()
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_transcript_error_renders_as_capture_status(qapp):
+    from desktop_client.events import TRANSCRIPT_ERROR
+
+    controller, overlay = make_controller(qapp)
+    await controller._on_event(
+        event(
+            TRANSCRIPT_ERROR,
+            {
+                "error_class": "STTProviderTransientError",
+                "retryable": True,
+                "message": "transcription failed",
+            },
+        )
+    )
+    assert overlay.status_label.text() == "transcription error"
+    assert "STTProviderTransientError" in overlay.partial_label.text()
+
+
+@pytest.mark.asyncio
+async def test_memory_actions(qapp):
+    api = FakeApi()
+    controller, overlay = make_controller(qapp, api)
+    controller.session_id = "s1"
+
+    await controller.forget_all_memory()
+    assert api.cleared_memory == 1
+    assert overlay.partial_label.text() == "memory erased"
+
+    await controller.retry_memory()
+    assert api.retried_memory == 1
+    assert overlay.partial_label.text() == "memory extraction queued"
+
+
+@pytest.mark.asyncio
+async def test_final_speaker_is_used_without_transcript_refetch(qapp):
+    api = FakeApi()
+    controller, overlay = make_controller(qapp, api)
+    controller.session_id = "s1"
+
+    await controller._on_event(
+        event(
+            TRANSCRIPT_FINAL,
+            {
+                "text": "Tell me about payments.",
+                "turn_id": "t1",
+                "segment_id": "seg1",
+                "sequence_number": 1,
+                "speaker": "interviewer",
+            },
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert overlay.transcript_edit.toPlainText() == (
+        "Interviewer: Tell me about payments."
+    )
+    assert api.transcript_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_answer_is_gated_and_ignores_candidate_turns(qapp):
+    api = FakeApi()
+    api.answer_events = [
+        (
+            "assistant.answer_done",
+            {"payload": {"turn_id": "a1", "validated_object": {"answer_text": "Ok."}}},
+        )
+    ]
+    controller, overlay = make_controller(qapp, api, auto_answer=True)
+    controller.session_id = "s1"
+
+    candidate_final = {
+        "text": "I led payments.",
+        "turn_id": "c1",
+        "segment_id": "seg-c",
+        "sequence_number": 1,
+        "speaker": "candidate",
+    }
+    await controller._on_event(event(TRANSCRIPT_FINAL, candidate_final))
+    await asyncio.sleep(0.05)
+    assert api.answer_calls == []
+
+    interviewer_final = {
+        "text": "Why did you leave?",
+        "turn_id": "q1",
+        "segment_id": "seg-q",
+        "sequence_number": 2,
+        "speaker": "interviewer",
+    }
+    await controller._on_event(event(TRANSCRIPT_FINAL, interviewer_final))
+    await controller._answer_task
+
+    assert api.answer_calls == [("q1", "c1", True)]
+    assert overlay.answer_edit.toPlainText() == "Ok."
+
+
+@pytest.mark.asyncio
+async def test_answer_skipped_is_not_an_error(qapp):
+    api = FakeApi()
+    api.answer_events = [
+        (
+            "assistant.answer_skipped",
+            {
+                "payload": {
+                    "turn_id": "q1",
+                    "answer_status": "skipped",
+                    "decision": "silent",
+                    "intent": "filler",
+                    "reason": "greeting_or_filler",
+                }
+            },
+        )
+    ]
+    controller, overlay = make_controller(qapp, api)
+    controller.session_id = "s1"
+
+    controller._start_answer("q1", None, gated=True)
+    await controller._answer_task
+
+    assert overlay.answer_edit.isHidden()
+    assert overlay.partial_label.text() == "answer skipped: greeting_or_filler"
+    assert overlay.retry_btn.isHidden()
+
+
+@pytest.mark.asyncio
+async def test_manual_answer_prefers_interviewer_turn_and_is_ungated(qapp):
+    api = FakeApi()
+    api.answer_events = [
+        ("assistant.answer_done", {"payload": {"validated_object": {"answer_text": "A"}}})
+    ]
+    controller, _ = make_controller(qapp, api)
+    controller.session_id = "s1"
+
+    for payload in (
+        {"turn_id": "c1", "text": "answer", "sequence_number": 1, "speaker": "candidate"},
+        {"turn_id": "q1", "text": "question", "sequence_number": 2, "speaker": "interviewer"},
+        {"turn_id": "c2", "text": "answer 2", "sequence_number": 3, "speaker": "candidate"},
+    ):
+        await controller._on_event(event(TRANSCRIPT_FINAL, payload))
+    await asyncio.sleep(0)
+
+    controller.answer_latest()
+    await controller._answer_task
+
+    assert api.answer_calls == [("q1", "c1", False)]
+
+
+@pytest.mark.asyncio
+async def test_start_rejects_unknown_audio_source(qapp):
+    controller, _ = make_controller(qapp, audio_source="screen")
+    with pytest.raises(SessionError):
+        await controller.start()

@@ -94,3 +94,48 @@ def test_relabel_speakers_keeps_unknown_turns():
     assert store.relabel_speakers({"t1": "interviewer"}) is True
     assert store.turns[0].speaker == "interviewer"
     assert store.turns[1].speaker == "candidate"
+
+
+def test_apply_final_uses_speaker_from_event():
+    store = TranscriptStore()
+    store.apply_final(
+        {
+            "text": "question",
+            "turn_id": "q1",
+            "sequence_number": 1,
+            "speaker": "interviewer",
+        }
+    )
+    store.apply_final(
+        {
+            "text": "answer",
+            "turn_id": "c1",
+            "sequence_number": 2,
+            "speaker": "candidate",
+        }
+    )
+    assert store.rendered_turns() == [("Interviewer", "question"), ("You", "answer")]
+
+
+def test_latest_turn_filters_and_candidate_before_sequence():
+    store = TranscriptStore()
+    for turn_id, sequence, speaker in (
+        ("c1", 1, "candidate"),
+        ("q1", 2, "interviewer"),
+        ("c2", 3, "candidate"),
+    ):
+        store.apply_final(
+            {
+                "text": turn_id,
+                "turn_id": turn_id,
+                "sequence_number": sequence,
+                "speaker": speaker,
+            }
+        )
+
+    assert store.latest_turn().turn_id == "c2"
+    assert store.latest_turn("interviewer").turn_id == "q1"
+    assert store.latest_turn("assistant") is None
+    # The candidate context for q1 is the answer that precedes it.
+    assert store.candidate_turn_id_before(2) == "c1"
+    assert store.candidate_turn_id_before(1) is None

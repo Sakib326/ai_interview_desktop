@@ -60,9 +60,23 @@ class TranscriptStore:
     def latest_speaker(self) -> Optional[str]:
         return self._turns[-1].speaker if self._turns else None
 
-    def candidate_turn_id(self) -> Optional[str]:
+    def latest_turn(self, speaker: Optional[str] = None) -> Optional[Turn]:
+        """Newest turn, optionally restricted to one speaker."""
+        if speaker is None:
+            return self._turns[-1] if self._turns else None
         for turn in reversed(self._turns):
-            if turn.speaker == SPEAKER_CANDIDATE:
+            if turn.speaker == speaker:
+                return turn
+        return None
+
+    def candidate_turn_id(self) -> Optional[str]:
+        turn = self.latest_turn(SPEAKER_CANDIDATE)
+        return turn.turn_id if turn else None
+
+    def candidate_turn_id_before(self, sequence_number: int) -> Optional[str]:
+        """Newest candidate turn that precedes ``sequence_number``."""
+        for turn in reversed(self._turns):
+            if turn.speaker == SPEAKER_CANDIDATE and turn.sequence_number < sequence_number:
                 return turn.turn_id
         return None
 
@@ -92,6 +106,7 @@ class TranscriptStore:
             turn_id=turn_id or f"segment:{segment_id}",
             text=str(payload.get("text") or ""),
             sequence_number=sequence if isinstance(sequence, int) else len(self._turns) + 1,
+            speaker=str(payload.get("speaker") or SPEAKER_CANDIDATE),
         )
         carried_partials = dict(self._partial_by_segment)
         self._turns.append(turn)

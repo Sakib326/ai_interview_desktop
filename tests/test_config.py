@@ -1,7 +1,38 @@
+import base64
+import json
+import time
+
 import pytest
 
-from desktop_client.config import Settings, derive_ws_base_url
+from desktop_client.config import (
+    Settings,
+    derive_ws_base_url,
+    token_expires_at,
+    token_expiring,
+)
 from desktop_client.main import build_settings
+
+
+def _jwt(payload: dict) -> str:
+    def enc(value):
+        return (
+            base64.urlsafe_b64encode(json.dumps(value).encode())
+            .rstrip(b"=")
+            .decode()
+        )
+
+    return f"{enc({'alg': 'none'})}.{enc(payload)}.sig"
+
+
+def test_token_expiry_helpers():
+    future = _jwt({"exp": time.time() + 3600})
+    past = _jwt({"exp": time.time() - 10})
+
+    assert token_expires_at(future) > time.time()
+    assert token_expiring(future) is False
+    assert token_expiring(past) is True
+    assert token_expires_at("not-a-jwt") == 0.0
+    assert token_expiring("not-a-jwt") is False
 
 
 def test_derive_ws_base_url():

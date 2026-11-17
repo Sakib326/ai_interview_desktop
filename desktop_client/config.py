@@ -7,13 +7,17 @@ shell-level overrides (and tests) win.
 
 from __future__ import annotations
 
+import base64
+import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
 
 API_PREFIX = "/api/v1"
+AUDIO_SOURCES = frozenset({"mic", "loopback"})
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -52,11 +56,35 @@ def derive_ws_base_url(api_base_url: str) -> str:
     return urlunsplit((scheme, parts.netloc, "", "", ""))
 
 
+def token_expires_at(token: str) -> float:
+    """Read ``exp`` from a JWT without verifying it. Returns 0 when unknown."""
+    if not token or token.count(".") != 2:
+        return 0.0
+    payload = token.split(".")[1]
+    padding = "=" * (-len(payload) % 4)
+    try:
+        data = json.loads(base64.urlsafe_b64decode(payload + padding))
+    except (ValueError, json.JSONDecodeError):
+        return 0.0
+    exp = data.get("exp")
+    return float(exp) if isinstance(exp, (int, float)) else 0.0
+
+
+def token_expiring(token: str, within_seconds: float = 120.0) -> bool:
+    """True when the token is known to expire within ``within_seconds``."""
+    exp = token_expires_at(token)
+    if not exp:
+        return False
+    return exp - time.time() <= within_seconds
+
+
 @dataclass
 class Settings:
     api_base_url: str = "http://127.0.0.1:8000"
     ws_base_url: str = ""
     access_token: str = ""
+    refresh_token: str = ""
+    device_id: str = ""
     session_id: str = ""
     goal_id: str = ""
     simulate_audio: bool = False
@@ -105,6 +133,8 @@ class Settings:
             api_base_url=get("DESKTOP_API_BASE_URL", "http://127.0.0.1:8000"),
             ws_base_url=get("DESKTOP_WS_BASE_URL"),
             access_token=access_token,
+            refresh_token=get("DESKTOP_REFRESH_TOKEN"),
+            device_id=get("DESKTOP_DEVICE_ID"),
             session_id=get("DESKTOP_SESSION_ID"),
             goal_id=get("DESKTOP_GOAL_ID"),
             simulate_audio=_as_bool(get("DESKTOP_SIMULATE_AUDIO")),

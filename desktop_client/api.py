@@ -7,13 +7,14 @@ fields.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any, AsyncIterator, Dict, Optional, Tuple
 
 import httpx
 
-from desktop_client.config import Settings
+from desktop_client.config import Settings, token_expiring
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,7 @@ class ApiClient:
         transport: Optional[httpx.AsyncBaseTransport] = None,
     ):
         self.settings = settings
+        self._refresh_lock = asyncio.Lock()
         self._client = httpx.AsyncClient(
             base_url=settings.api_v1,
             timeout=settings.request_timeout_seconds,
@@ -124,14 +126,83 @@ class ApiClient:
         token = self.settings.access_token
         return {"Authorization": f"Bearer {token}"} if token else {}
 
+    @property
+    def can_refresh(self) -> bool:
+        return bool(self.settings.refresh_token and self.settings.device_id)
+
+    async def refresh_token(self) -> bool:
+        """Rotate the access token via ``POST /auth/refresh``.
+
+        Updates the shared :class:`Settings` (mutated in place), so the
+        WebSocket clients pick up the new bearer token on their next connect.
+        Returns False when refresh is not configured or the server rejects it.
+        """
+        if not self.can_refresh:
+            return False
+        async with self._refresh_lock:
+            try:
+                response = await self._client.post(
+                    "/auth/refresh",
+                    json={
+                        "refresh_token": self.settings.refresh_token,
+                        "device_id": self.settings.device_id,
+                    },
+                )
+            except httpx.HTTPError as exc:
+                logger.warning("Token refresh failed: %s", exc)
+                return False
+            if response.status_code != 200:
+                logger.warning(
+                    "Token refresh rejected (%s)", response.status_code
+                )
+                return False
+            try:
+                data = response.json()
+            except ValueError:
+                return False
+
+        access = data.get("access_token")
+        if not access:
+            return False
+        self.settings.access_token = access
+        # The refresh token rotates on every use.
+        self.settings.refresh_token = data.get("refresh_token") or self.settings.refresh_token
+        self.settings.device_id = data.get("device_id") or self.settings.device_id
+        self._client.headers["Authorization"] = f"Bearer {access}"
+        logger.info("Access token refreshed")
+        return True
+
+    async def ensure_fresh_token(
+        self, within_seconds: float = 120.0, force: bool = False
+    ) -> bool:
+        """Refresh ahead of expiry. No-op when refresh is not configured."""
+        if not self.can_refresh:
+            return False
+        if not force and not token_expiring(
+            self.settings.access_token, within_seconds
+        ):
+            return False
+        return await self.refresh_token()
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    async def _request(
+        self, method: str, path: str, *, _allow_refresh: bool = True, **kwargs: Any
+    ) -> Any:
+        if token_expiring(self.settings.access_token):
+            await self.ensure_fresh_token()
+
         try:
             response = await self._client.request(method, path, **kwargs)
         except httpx.HTTPError as exc:
             raise ApiError(0, "network_error", str(exc), retryable=True) from exc
+
+        if response.status_code == 401 and _allow_refresh:
+            if await self.refresh_token():
+                return await self._request(
+                    method, path, _allow_refresh=False, **kwargs
+                )
 
         if response.status_code >= 400:
             try:
@@ -204,17 +275,26 @@ class ApiClient:
         session_id: str,
         question_turn_id: str,
         candidate_turn_id: Optional[str] = None,
+        *,
+        gated: bool = False,
     ) -> AsyncIterator[Tuple[str, Dict[str, Any]]]:
-        """Stream ``assistant.answer_*`` SSE events for one question turn."""
+        """Stream ``assistant.answer_*`` SSE events for one question turn.
+
+        ``gated=True`` uses ``POST /sessions/{id}/live/answer``, where the
+        backend Turn Gate may answer ``assistant.answer_skipped`` instead of
+        generating. The default manual path is never gated.
+        """
         body: Dict[str, Any] = {"question_turn_id": question_turn_id}
         if candidate_turn_id:
             body["candidate_turn_id"] = candidate_turn_id
+        key_prefix = "live-answer" if gated else "answer"
         headers = {
             "Accept": "text/event-stream",
-            # Stable per question so a retry replays instead of regenerating.
-            "Idempotency-Key": f"answer-{question_turn_id}",
+            # Stable per (mode, question) so a retry replays the recorded run.
+            "Idempotency-Key": f"{key_prefix}-{question_turn_id}",
         }
-        url = f"/sessions/{session_id}/practice/answer"
+        channel = "live/answer" if gated else "practice/answer"
+        url = f"/sessions/{session_id}/{channel}"
         try:
             async with self._client.stream(
                 "POST", url, json=body, headers=headers

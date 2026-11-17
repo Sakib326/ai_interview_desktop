@@ -99,6 +99,7 @@ class EventClient:
         *,
         on_replay_gap: Optional[Callable[[ServerEvent], Awaitable[None]]] = None,
         on_state_change: Optional[Callable[[str], None]] = None,
+        on_auth_expired: Optional[Callable[[], Awaitable[bool]]] = None,
         heartbeat_seconds: Optional[float] = None,
         max_backoff_seconds: float = 30.0,
         initial_backoff_seconds: float = 1.0,
@@ -108,6 +109,7 @@ class EventClient:
         self._on_event = on_event
         self._on_replay_gap = on_replay_gap
         self._on_state_change = on_state_change
+        self._on_auth_expired = on_auth_expired
         self._heartbeat_seconds = heartbeat_seconds or max(
             1.0, min(settings.heartbeat_seconds, 30.0)
         )
@@ -137,16 +139,27 @@ class EventClient:
     async def run(self) -> None:
         """Connect/consume/reconnect until :meth:`stop` is called."""
         backoff = self._initial_backoff
+        auth_retry_used = False
         while not self._stop.is_set():
             try:
                 await self._session_once()
                 backoff = self._initial_backoff
-            except EventStreamAuthError:
+                auth_retry_used = False
+            except EventStreamAuthError as exc:
+                if not auth_retry_used and await self._try_refresh():
+                    auth_retry_used = True
+                    logger.info("Retrying events socket with refreshed token")
+                    continue
+                logger.error("Events socket rejected: %s", exc)
                 self._notify_state("unauthorized")
                 return
             except (InvalidStatus, InvalidHandshake) as exc:
                 status = getattr(getattr(exc, "response", None), "status_code", None)
                 if status in (401, 403):
+                    if not auth_retry_used and await self._try_refresh():
+                        auth_retry_used = True
+                        logger.info("Retrying events handshake with refreshed token")
+                        continue
                     logger.error("Events socket rejected (%s); not retrying", status)
                     self._notify_state("unauthorized")
                     return
@@ -163,6 +176,15 @@ class EventClient:
             self._notify_state("reconnecting")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, self._max_backoff)
+
+    async def _try_refresh(self) -> bool:
+        if self._on_auth_expired is None:
+            return False
+        try:
+            return await self._on_auth_expired()
+        except Exception:  # pragma: no cover - refresh must not kill the loop
+            logger.exception("Token refresh callback failed")
+            return False
 
     async def _session_once(self) -> None:
         url = self._url()

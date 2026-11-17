@@ -112,8 +112,10 @@ modules.
 ### 3.5 Audio socket (`audio_ws.py`)
 - Sends raw bytes as binary frames; one 50 ms frame per message (within
   AssemblyAI's 20–1,000 ms range, and the backend does no padding).
-- Appends `?source=mic|loopback` from config. The backend ignores unknown query
-  params today; this is forward-compatible with source tagging.
+- Appends `?source=mic|loopback` from config. The backend validates it and maps
+  the value to the persisted `Turn.speaker` (`candidate` / `interviewer`); an
+  unknown value is rejected with `audio.failed` + close `1008`, so the client
+  validates the setting before connecting.
 - Sends `{"type":"client.audio_end"}` after the last frame, then awaits
   `audio.closed` / `audio.failed` with a 12 s timeout.
 - Returns `AudioOutcome(status, error_class, retryable, message)` with
@@ -126,10 +128,12 @@ modules.
 - Deltas are keyed by `segment_id` and replace the text for that segment;
   a final clears the matching partial.
 - Turns are kept sorted by `sequence_number` even if a replay arrives late.
+- `speaker` comes from the event payload (`microphone` capture is `candidate`,
+  `loopback` is `interviewer`).
 - `merge_authoritative(transcript)` merges `GET /transcript` rather than
   replacing: the REST list can lag the event stream, and replacing with an
-  empty read would erase just-rendered finals. This is also the only source of
-  real `speaker` labels.
+  empty read would erase just-rendered finals. It is now only a fallback for
+  backends that omit `speaker`, plus the replay-gap resync path.
 
 ### 3.7 Overlay (`overlay.py`)
 - Flags: `FramelessWindowHint | WindowStaysOnTopHint | Tool |
@@ -175,12 +179,21 @@ Ordered lifecycle:
 3. `POST /sessions` with `kind="live"` and the acknowledged version. A `409`
    means a session already exists, so the active one is adopted and acked.
 4. Start `/events`, wait for `connected` (≤15 s), then start `/audio`.
-5. Render deltas/finals; refetch the transcript after each final for speakers.
-6. Answers: `answer_latest()` (F10) or auto-answer when enabled. One stream per
-   question turn; a new question cancels the previous stream.
+5. Render deltas/finals; `speaker` comes from the event, so no per-final
+   transcript refetch (kept only as a fallback when `speaker` is absent).
+6. Answers: auto-answer only for `interviewer` finals via the gated
+   `POST /live/answer` (skip clears the pane); F10 uses the ungated
+   `POST /practice/answer`. One stream per question turn; a new question
+   cancels the previous stream.
 7. Stop: `client.audio_end` -> wait for `audio.closed` (25 s cap) -> end the
    session -> poll debrief -> fetch -> memory summary.
-8. Shutdown cancels all tasks and closes the HTTP client.
+8. Shutdown ends the session (unless it is a reused `DESKTOP_SESSION_ID`),
+   cancels all tasks, and closes the HTTP client.
+9. Token refresh runs on a 30 s maintenance task, plus on HTTP 401 and once on
+   a 4401 WebSocket rejection. The refresh token rotates and is kept in memory.
+10. A retryable `audio.failed` or a dropped audio socket restarts the stream
+    once; a user Stop never retries.
+11. Tray actions cover erase-all memory (confirmed) and extraction retry.
 
 Long operations (transcript refresh, answers, debrief) run as tasks so the
 events reader is never blocked.
@@ -199,23 +212,27 @@ events reader is never blocked.
 | API/SSE | token/done parsing, idempotency header, structured 503/404 errors, memory, malformed frames |
 | Events socket | initial status + delta + final, subprotocol header, heartbeat, reconnect+resubscribe, 4401 stop, replay gap |
 | Audio socket | frame forwarding, `client.audio_end`, `audio.closed`, `audio.failed`, disconnect, finalize timeout |
-| Controller | transcript rendering, dedup, capture status, replay-gap resync, answer success/failure+retry, end→debrief→memory, generate_failed retry, session adoption/creation/preflight |
-| Live smoke (opt-in) | real backend round trip: preflight → create → events → audio → stop → end → debrief → memory |
+| Controller | transcript rendering, dedup, capture status, replay-gap resync, answer success/failure+retry, end→debrief→memory, generate_failed retry, session adoption/creation/preflight, preflight model/warnings, audio restart, end-on-quit, memory actions |
+| Live smoke (opt-in) | real backend round trip: preflight → create → events → audio → stop → end → debrief → memory; plus `stub_stt` runs for speaker labels and the gated answer |
 
 ```bash
 QT_QPA_PLATFORM=offscreen pytest -q
-# 56 passed, 1 skipped
+# 75 passed, 1 skipped
 ```
 
 Socket tests use real local `websockets` servers; HTTP tests use
 `httpx.MockTransport`. No backend, keys, or audio hardware required.
 
 The skipped test is `tests/test_live_smoke.py`; set `DESKTOP_LIVE_API` and
-`DESKTOP_LIVE_TOKEN` to run it against a real backend. It was verified against
-the `ai_interview` server on a disposable migrated DB: the session was created
-and ended, the acceptable-use version was acknowledged, `system.error
-stt_provider_unavailable` was surfaced (no AssemblyAI key), and the debrief
-resolved to `no_content` with `total_turns: 0`.
+`DESKTOP_LIVE_TOKEN` to run it against a real backend. Verified against the
+`ai_interview` server on a disposable migrated DB in three modes:
+
+1. No provider keys: lifecycle + `stt_provider_unavailable` + `no_content`.
+2. `mic` + `stub_stt`: final carries `speaker=candidate`, rendered as `You: …`
+   with no transcript refetch.
+3. `loopback` + gated auto-answer: `Interviewer: …`, `/live/answer` runs the
+   Turn Gate, and the backend persists an `assistant` turn plus
+   `session.answer_generated`.
 
 ### 4.2 Entry point
 ```bash
@@ -229,10 +246,10 @@ python -m desktop_client.main --simulate-audio
 
 | Gap | Client behavior |
 |---|---|
-| No `speaker` on transcript events | Assume candidate, then relabel from `GET /transcript` after each final |
-| Finals default to `speaker="candidate"` | `DESKTOP_AUTO_ANSWER` defaults off; F10 is the deliberate trigger |
 | No audio-format negotiation | Assumes 16 kHz S16LE mono 50 ms; documented as an assumption |
-| No `/audio` source parameter | Sends `?source=mic`; harmless today, ready for the backend change |
+| No `speaker` (older backends) | Falls back to assuming candidate and refetching `GET /transcript` after a final; current backends send `speaker` and skip the refetch |
+| Turn Gate absent (older backends) | Auto-answer uses `live/answer`; if a deployment lacks it, the request fails and is surfaced as an error |
+| No loopback capture | `DESKTOP_AUDIO_SOURCE` tags the stream, but only microphone audio is captured |
 
 ---
 

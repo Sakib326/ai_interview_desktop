@@ -4,19 +4,26 @@ PySide6 always-on-top overlay with microphone capture, Windows capture
 exclusion (stealth), and a full backend integration: session preflight, the
 `/events` and `/audio` WebSockets, streaming SSE answers, debrief, and memory.
 
+See [`INTEGRATION_STATUS.md`](./INTEGRATION_STATUS.md) for the client ↔ backend
+contract audit, live-run evidence, and the remaining server-side gaps.
+
 ## Scope
 
 - **Overlay:** frameless, translucent, always-on-top, non-activating. Pulsing
   recording dot, transcript with speaker labels, live answer pane, stealth
   badge, Stop/Close.
 - **Audio:** 50 ms PCM S16LE 16 kHz mono frames (1,600 bytes) from
-  `sounddevice.RawInputStream`, streamed as binary WebSocket frames.
+  `sounddevice.RawInputStream`, streamed as binary WebSocket frames. The
+  `?source=mic|loopback` tag tells the backend to persist turns as `candidate`
+  or `interviewer`.
 - **Events:** `WS /api/v1/sessions/{id}/events` with `bearer.<jwt>`
   subprotocol, 20 s heartbeats, reconnect + `client.resubscribe`, and
   `system.replay_gap` resync through `GET /sessions/{id}/transcript`.
-- **Answers:** `POST /api/v1/sessions/{id}/practice/answer` (SSE), rendered
-  token by token, finalized on `answer_done`, retry surfaced on
-  `answer_failed` when retryable.
+  Transcript events carry `speaker`, so labels render without a REST refetch.
+- **Answers:** auto-answer uses the gated `POST /sessions/{id}/live/answer`
+  (Turn Gate may emit `answer_skipped`); F10 uses the always-answer
+  `POST /sessions/{id}/practice/answer`. Both stream SSE, render token by
+  token, finalize on `answer_done`, and surface retryable failures.
 - **Session end:** `client.audio_end` -> `audio.closed`, `POST /sessions/{id}/end`,
   debrief status polling/fetch/retry, memory summary.
 - **Stealth:** best-effort screen-share exclusion via
@@ -64,7 +71,7 @@ python -m desktop_client.main --simulate-audio
 | `--simulate-audio` | Emit silent frames instead of opening a device |
 | `--session <id>` | Reuse an existing session (acks it if pending) |
 | `--api-url <url>` | Override the backend origin (ws origin is derived) |
-| `--auto-answer` | Answer after every transcript final |
+| `--auto-answer` | Answer interviewer finals through the gated live endpoint |
 | `--no-answer` | Never auto-answer (F10 still works) |
 | `--no-tray` | Disable the tray icon |
 | `--no-hotkeys` | Disable Windows global hotkeys |
@@ -79,7 +86,15 @@ Global (Windows `RegisterHotKey`, work while another app has focus):
 
 The tray menu mirrors these plus show/hide, Stop, and Quit. The tray exists
 because click-through mode cannot be clicked out of: the overlay itself stops
-receiving mouse input.
+receiving mouse input. It also carries **Forget all memory…** (confirmed) and
+**Retry memory extraction** when a backend is configured.
+
+### Tokens
+
+Set `DESKTOP_REFRESH_TOKEN` and `DESKTOP_DEVICE_ID` alongside the access token
+to survive the 60-minute access-token lifetime: the client refreshes ahead of
+expiry, on HTTP 401, and once on a `4401` WebSocket rejection. Without them a
+long session ends at the first expiry.
 
 ---
 
@@ -90,8 +105,9 @@ GET  /policies/acceptable-use            -> version
 POST /sessions/preflight                 -> blockers/warnings
 POST /sessions  (kind=live, ack=version) -> active (or adopt the 409 active one)
 WS   /sessions/{id}/events               -> initial session.status_changed
-WS   /sessions/{id}/audio                -> 1,600-byte binary frames
+WS   /sessions/{id}/audio?source=mic     -> 1,600-byte binary frames
      client.audio_end                    -> audio.closed | audio.failed
+POST /sessions/{id}/live/answer          -> SSE tokens | answer_skipped (gated)
 POST /sessions/{id}/end                  -> debrief enqueued
 GET  /sessions/{id}/debrief/status       -> poll until not `writing`
 GET  /sessions/{id}/debrief              -> 200 ready / 202 writing / 404 none
@@ -137,7 +153,7 @@ tests/
 
 ```bash
 QT_QPA_PLATFORM=offscreen pytest -q
-# 56 passed, 1 skipped
+# 75 passed, 1 skipped
 ```
 
 The socket tests start real local WebSocket servers; the HTTP tests use
@@ -164,12 +180,15 @@ asserts the lifecycle and error surfacing rather than transcript text.
 
 ## Known limitations
 
-- Transcript event payloads have **no `speaker`**; finals are assumed to be the
-  candidate and are relabeled from `GET /sessions/{id}/transcript`. Reliable
-  interviewer/candidate separation needs backend source tagging.
-- `DESKTOP_AUTO_ANSWER` is off by default for that reason; use F10 to answer
-  deliberately.
+- **Loopback capture is not implemented.** `DESKTOP_AUDIO_SOURCE` correctly tags
+  the stream, but the client only captures the microphone, so interviewer
+  audio requires routing system audio into the capture path.
+- Auto-answer only fires for `interviewer` finals (gated endpoint). With
+  mic-only capture there are no interviewer turns, so use F10 or configure
+  loopback.
 - `/audio` does not negotiate audio format; 16 kHz S16LE mono is an assumption.
+- No interactive OIDC login yet: the access token (and optional refresh
+  credentials) must be supplied via the environment.
 - Stealth is Windows-only and best-effort; macOS/Linux report `UNSUPPORTED`.
   The §10.6 capture matrix must be run on the target machine before ship.
 - No packaging/installer yet; see `NEXT_STEPS.md`.

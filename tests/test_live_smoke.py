@@ -22,6 +22,8 @@ from desktop_client.session import LiveSessionController
 
 LIVE_API = os.environ.get("DESKTOP_LIVE_API", "")
 LIVE_TOKEN = os.environ.get("DESKTOP_LIVE_TOKEN", "")
+LIVE_SOURCE = os.environ.get("DESKTOP_LIVE_SOURCE", "mic")
+LIVE_AUTO_ANSWER = os.environ.get("DESKTOP_LIVE_AUTO_ANSWER", "") == "1"
 
 pytestmark = [
     pytest.mark.live,
@@ -38,7 +40,8 @@ async def test_live_session_round_trip(qapp):
         api_base_url=LIVE_API,
         access_token=LIVE_TOKEN,
         simulate_audio=True,
-        auto_answer=False,
+        auto_answer=LIVE_AUTO_ANSWER,
+        audio_source=LIVE_SOURCE,
     )
     overlay = OverlayWindow()
     overlay.show()
@@ -48,7 +51,13 @@ async def test_live_session_round_trip(qapp):
         await controller.start()
         assert controller.session_id, "no session was created or adopted"
 
-        await asyncio.sleep(3.0)
+        if LIVE_AUTO_ANSWER:
+            # The stub provider emits finals on audio_end, so let the stream
+            # run briefly and then Stop; stop() waits for the last answer.
+            await asyncio.sleep(1.5)
+        else:
+            await asyncio.sleep(3.0)
+
         status_during_capture = overlay.status_label.text()
 
         await controller.stop()
@@ -56,14 +65,21 @@ async def test_live_session_round_trip(qapp):
 
         print("\n--- live smoke ---")
         print("session :", controller.session_id)
+        print("source  :", LIVE_SOURCE)
         print("status  :", status_during_capture)
         print("audio   :", audio)
         print("turns   :", overlay.transcript_edit.toPlainText())
         print("answer  :", overlay.answer_edit.toPlainText())
         print("partial :", overlay.partial_label.text())
+        print("answered:", sorted(controller.answered_turn_ids))
 
         assert status_during_capture not in {"offline", "unauthorized"}
         assert audio is not None
         assert audio.status in {"closed", "failed", "disconnected", "timeout"}
+        if LIVE_AUTO_ANSWER:
+            # The gated endpoint either answered or explicitly skipped the turn.
+            assert controller.answered_turn_ids, (
+                "gated answer neither answered nor skipped"
+            )
     finally:
         await controller.shutdown()

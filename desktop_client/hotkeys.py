@@ -136,7 +136,7 @@ def _tray_icon() -> QIcon:
 class TrayIcon(QObject):
     """Tray entry point: show/hide, toggles, and quit."""
 
-    def __init__(self, overlay, on_quit: Callable[[], None]):
+    def __init__(self, overlay, on_quit: Callable[[], None], extra_actions=None):
         super().__init__(overlay)
         self.overlay = overlay
         self._on_quit = on_quit
@@ -168,6 +168,12 @@ class TrayIcon(QObject):
         menu.addAction(self.click_through_action)
         menu.addAction(self.stealth_action)
         menu.addSeparator()
+        for label, callback in extra_actions or []:
+            action = QAction(label, menu)
+            action.triggered.connect(callback)
+            menu.addAction(action)
+        if extra_actions:
+            menu.addSeparator()
         menu.addAction(self.stop_action)
         menu.addAction(quit_action)
 
