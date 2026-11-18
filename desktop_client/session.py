@@ -43,6 +43,7 @@ DEBRIEF_POLL_SECONDS = 2.0
 DEBRIEF_TIMEOUT_SECONDS = 120.0
 AUDIO_FINALIZE_WAIT_SECONDS = 25.0
 AUDIO_RETRY_DELAY_SECONDS = 1.0
+AUTO_ANSWER_DELAY_SECONDS = 1.5  # fallback when settings value is unavailable
 
 
 class SessionError(Exception):
@@ -79,6 +80,7 @@ class LiveSessionController:
         self.audio_outcome: Optional[AudioOutcome] = None
         self._answered_turns: set = set()
         self._retry_handler = None
+        self._pending_auto_answer: Optional[asyncio.TimerHandle] = None
         # Backend caches create responses per (user, key) for the process
         # lifetime, so the key must be unique per launch attempt. A constant key
         # would replay the first session of the process (already ended) forever.
@@ -128,6 +130,7 @@ class LiveSessionController:
         if self._stopping:
             return
         self._stopping = True
+        self._cancel_pending_auto_answer()
         self._active_stop_task = asyncio.current_task()
         try:
             self.overlay.set_status("stopping")
@@ -178,6 +181,7 @@ class LiveSessionController:
             return
         self._closing = True
         self._stop_event.set()
+        self._cancel_pending_auto_answer()
 
         # Closing the window is a cancellation, not a Stop: audio is not
         # flushed. Still end the session so it does not stay 'active' and get
@@ -495,11 +499,11 @@ class LiveSessionController:
                     self.settings.auto_answer
                     and turn.speaker == SPEAKER_INTERVIEWER
                 ):
-                    # Gated path: the Turn Gate decides whether to answer.
-                    self._start_answer(
+                    # Debounce: wait briefly for more speech/finals so we don't
+                    # answer mid-question when STT finalizes on a short pause.
+                    self._schedule_auto_answer(
                         turn.turn_id,
                         self.transcript.candidate_turn_id_before(turn.sequence_number),
-                        gated=True,
                     )
 
         elif kind == TRANSCRIPT_ERROR:
@@ -575,6 +579,32 @@ class LiveSessionController:
         self.overlay.set_partial(self.transcript.partial_text)
 
     # ----------------------------------------------------------------- answers
+    def _cancel_pending_auto_answer(self) -> None:
+        if self._pending_auto_answer is not None:
+            self._pending_auto_answer.cancel()
+            self._pending_auto_answer = None
+
+    def _schedule_auto_answer(
+        self, question_turn_id: str, candidate_turn_id: Optional[str]
+    ) -> None:
+        """Delay auto-answer so a brief mid-speech pause doesn't trigger it."""
+        self._cancel_pending_auto_answer()
+
+        def _fire() -> None:
+            self._pending_auto_answer = None
+            if self._stopping or self._stop_event.is_set():
+                return
+            if question_turn_id in self._answered_turns:
+                return
+            self._start_answer(question_turn_id, candidate_turn_id, gated=True)
+
+        delay = getattr(
+            self.settings, "auto_answer_delay_seconds", AUTO_ANSWER_DELAY_SECONDS
+        )
+        self._pending_auto_answer = asyncio.get_running_loop().call_later(
+            delay, _fire
+        )
+
     def answer_latest(self) -> None:
         """Manual (F10) answer: prefer the interviewer's latest question."""
         turn = (
@@ -596,6 +626,7 @@ class LiveSessionController:
         *,
         gated: bool = False,
     ) -> None:
+        self._cancel_pending_auto_answer()
         if self._answer_task is not None and not self._answer_task.done():
             self._answer_task.cancel()
         self._answer_task = asyncio.create_task(

@@ -123,6 +123,7 @@ class Settings:
     simulate_audio: bool = False
     heartbeat_seconds: float = 20.0
     auto_answer: bool = False
+    auto_answer_delay_seconds: float = 1.5
     audio_source: str = "mic"
     request_timeout_seconds: float = 30.0
 
@@ -174,6 +175,9 @@ class Settings:
             simulate_audio=_as_bool(get("DESKTOP_SIMULATE_AUDIO")),
             heartbeat_seconds=float(get("DESKTOP_HEARTBEAT_SECONDS", "20")),
             auto_answer=_as_bool(get("DESKTOP_AUTO_ANSWER")),
+            auto_answer_delay_seconds=float(
+                get("DESKTOP_AUTO_ANSWER_DELAY_SECONDS", "1.5")
+            ),
             audio_source=normalize_audio_source(get("DESKTOP_AUDIO_SOURCE", "mic") or "mic"),
             request_timeout_seconds=float(get("DESKTOP_REQUEST_TIMEOUT", "30")),
         )

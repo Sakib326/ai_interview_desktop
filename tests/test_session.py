@@ -591,7 +591,9 @@ async def test_auto_answer_is_gated_and_ignores_candidate_turns(qapp):
             {"payload": {"turn_id": "a1", "validated_object": {"answer_text": "Ok."}}},
         )
     ]
-    controller, overlay = make_controller(qapp, api, auto_answer=True)
+    controller, overlay = make_controller(
+        qapp, api, auto_answer=True, auto_answer_delay_seconds=0.01
+    )
     controller.session_id = "s1"
 
     candidate_final = {
@@ -613,6 +615,7 @@ async def test_auto_answer_is_gated_and_ignores_candidate_turns(qapp):
         "speaker": "interviewer",
     }
     await controller._on_event(event(TRANSCRIPT_FINAL, interviewer_final))
+    await asyncio.sleep(0.05)
     await controller._answer_task
 
     assert api.answer_calls == [("q1", "c1", True)]
