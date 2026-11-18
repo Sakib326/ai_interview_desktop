@@ -89,13 +89,15 @@ class GlobalHotkeys:
             if not hwnd:
                 return False
             user32 = ctypes.windll.user32
-            self._filter = _WindowsHotkeyFilter(self.bindings)
+            id_callbacks: Dict[int, Callable[[], None]] = {}
+            self._filter = _WindowsHotkeyFilter(id_callbacks)
             self._filter.install()
-            for vk in self.bindings:
+            for vk, callback in self.bindings.items():
                 hotkey_id = self._next_id
                 self._next_id += 1
                 if user32.RegisterHotKey(hwnd, hotkey_id, MOD_NOREPEAT, vk):
                     self._registered.append((hwnd, hotkey_id))
+                    id_callbacks[hotkey_id] = callback
                 else:
                     logger.warning("RegisterHotKey failed for VK 0x%02X", vk)
             return bool(self._registered)
