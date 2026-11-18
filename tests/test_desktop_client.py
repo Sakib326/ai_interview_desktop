@@ -301,6 +301,7 @@ async def test_mic_frames_yields_1600_byte_frames():
 class _FakeAudioStream:
     def __init__(self, callback, **kwargs):
         self.callback = callback
+        self.kwargs = kwargs
 
     def start(self):
         # One full 50 ms frame plus a 1,000-byte partial tail.
@@ -314,8 +315,11 @@ class _FakeAudioStream:
 
 
 class _FakeSoundDevice:
+    last_kwargs = None
+
     @staticmethod
     def RawInputStream(**kwargs):
+        _FakeSoundDevice.last_kwargs = kwargs
         return _FakeAudioStream(**kwargs)
 
 
@@ -371,3 +375,56 @@ def test_overlay_stealth_disabled_badge_is_visible_to_share(qapp):
     assert overlay.stealth_badge.text() == "visible to share"
     overlay.toggle_stealth()
     overlay.close()
+
+
+@pytest.mark.asyncio
+async def test_mic_frames_loopback_uses_wasapi(monkeypatch):
+    class _LoopbackStream(_FakeAudioStream):
+        def start(self):
+            self.callback(b"\x02" * 1600, 1600, None, None)
+
+    class _LoopbackSoundDevice:
+        last_kwargs = None
+        default = type("D", (), {"device": (0, 5)})()
+
+        class WasapiSettings:
+            def __init__(self, loopback=False):
+                self.loopback = loopback
+
+        @staticmethod
+        def RawInputStream(**kwargs):
+            _LoopbackSoundDevice.last_kwargs = kwargs
+            return _LoopbackStream(**kwargs)
+
+    monkeypatch.setitem(sys.modules, "sounddevice", _LoopbackSoundDevice)
+    stop = asyncio.Event()
+    agen = mic_frames(source="loopback", allow_simulation_fallback=False, stop_event=stop)
+    frame = await anext(agen)
+    stop.set()
+    await agen.aclose()
+
+    assert len(frame) == 1600
+    extra = _LoopbackSoundDevice.last_kwargs.get("extra_settings")
+    assert extra is not None and getattr(extra, "loopback", False) is True
+
+
+def test_audio_conversion_downmix_and_resample():
+    # 1 kHz sine-ish pattern at 48 kHz stereo -> 16 kHz mono, 50 ms = 800 samples out.
+    import math
+
+    from desktop_client.audio import _convert_to_target
+
+    in_rate = 48000
+    in_channels = 2
+    n = int(in_rate * 0.05)
+    data = bytearray()
+    for i in range(n):
+        s = int(10000 * math.sin(2 * math.pi * 440 * (i / in_rate)))
+        data.extend(int(s).to_bytes(2, "little", signed=True))
+        data.extend(int(s).to_bytes(2, "little", signed=True))
+    ctx = {"in_rate": in_rate, "in_channels": in_channels, "state": {"buf": __import__("array").array("h"), "pos": 0.0}}
+    out = _convert_to_target(bytes(data), ctx)
+    assert len(out) == 1600  # 800 samples * 2 bytes
+    samples = __import__("array").array("h")
+    samples.frombytes(out)
+    assert max(abs(x) for x in samples) > 0

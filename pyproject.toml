@@ -29,6 +29,9 @@ build = [
 [project.scripts]
 desktop-client = "desktop_client.main:main"
 
+[tool.setuptools.packages.find]
+include = ["desktop_client*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

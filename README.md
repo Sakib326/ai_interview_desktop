@@ -194,12 +194,14 @@ asserts the lifecycle and error surfacing rather than transcript text.
 
 ## Known limitations
 
-- **Loopback capture is not implemented.** `DESKTOP_AUDIO_SOURCE` correctly tags
-  the stream, but the client only captures the microphone, so interviewer
-  audio requires routing system audio into the capture path.
+- **System/loopback audio capture** (Windows, WASAPI) is implemented. Set
+  `DESKTOP_AUDIO_SOURCE=both` to capture microphone and system/output audio
+  simultaneously (recommended), or `loopback` for system audio only, or `mic`
+  for microphone only. Turns are tagged `candidate` (mic) / `interviewer`
+  (loopback). Use headphones to avoid feedback/leakage.
 - Auto-answer only fires for `interviewer` finals (gated endpoint). With
-  mic-only capture there are no interviewer turns, so use F10 or configure
-  loopback.
+  `DESKTOP_AUDIO_SOURCE=mic` there are no interviewer turns, so use F10 or run
+  in `loopback`/`both` mode with interviewer audio playing through system output.
 - `/audio` does not negotiate audio format; 16 kHz S16LE mono is an assumption.
 - No interactive OIDC login yet: the access token (and optional refresh
   credentials) must be supplied via the environment.

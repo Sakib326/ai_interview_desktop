@@ -23,7 +23,7 @@ from typing import Any, Dict, Optional
 from desktop_client.api import ApiClient, ApiError
 from desktop_client.audio import mic_frames
 from desktop_client.audio_ws import AudioOutcome, AudioSender
-from desktop_client.config import AUDIO_SOURCES, Settings
+from desktop_client.config import Settings, audio_source_channels
 from desktop_client.events import (
     DEBRIEF_STATUS_CHANGED,
     SESSION_STATUS_CHANGED,
@@ -74,6 +74,7 @@ class LiveSessionController:
         self._closing = False
         self._stopping = False
         self._ended = False
+        self._active_stop_task: Optional[asyncio.Task] = None
         self.preflight_warnings: list = []
         self.audio_outcome: Optional[AudioOutcome] = None
         self._answered_turns: set = set()
@@ -94,11 +95,10 @@ class LiveSessionController:
     async def start(self) -> None:
         if not self.settings.configured:
             raise SessionError("DESKTOP_ACCESS_TOKEN is required for a live session")
-        if self.settings.audio_source not in AUDIO_SOURCES:
-            raise SessionError(
-                f"Unknown audio source {self.settings.audio_source!r}; "
-                f"expected one of {sorted(AUDIO_SOURCES)}"
-            )
+        try:
+            audio_source_channels(self.settings.audio_source)
+        except ValueError as exc:
+            raise SessionError(str(exc)) from exc
 
         session = await self._ensure_session()
         self.session_id = session["id"]
@@ -128,44 +128,49 @@ class LiveSessionController:
         if self._stopping:
             return
         self._stopping = True
-        self.overlay.set_status("stopping")
-        self.overlay.set_partial("Flushing audio\u2026")
-        self._stop_event.set()
+        self._active_stop_task = asyncio.current_task()
+        try:
+            self.overlay.set_status("stopping")
+            self.overlay.set_partial("Flushing audio\u2026")
+            self._stop_event.set()
 
-        if self._audio_task is not None:
-            try:
-                await asyncio.wait_for(self._audio_task, AUDIO_FINALIZE_WAIT_SECONDS)
-            except asyncio.TimeoutError:
-                logger.warning("Audio task did not finish in time")
-                self._audio_task.cancel()
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("Audio task failed")
+            if self._audio_task is not None:
+                try:
+                    await asyncio.wait_for(self._audio_task, AUDIO_FINALIZE_WAIT_SECONDS)
+                except asyncio.TimeoutError:
+                    logger.warning("Audio task did not finish in time")
+                    self._audio_task.cancel()
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception("Audio task failed")
 
-        # A final emitted during the audio flush can start an answer. Let it
-        # finish before ending the session, or the answer races the end (409).
-        if self.settings.auto_answer and self._answer_task is None:
-            deadline = asyncio.get_running_loop().time() + 3.0
-            while (
-                self._answer_task is None
-                and asyncio.get_running_loop().time() < deadline
-            ):
-                await asyncio.sleep(0.05)
-        if self._answer_task is not None:
-            try:
-                await asyncio.wait_for(asyncio.shield(self._answer_task), 20.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
-            except Exception:
-                logger.exception("Last answer failed during stop")
+            # A final emitted during the audio flush can start an answer. Let it
+            # finish before ending the session, or the answer races the end (409).
+            if self.settings.auto_answer and self._answer_task is None:
+                deadline = asyncio.get_running_loop().time() + 3.0
+                while (
+                    self._answer_task is None
+                    and asyncio.get_running_loop().time() < deadline
+                ):
+                    await asyncio.sleep(0.05)
+            if self._answer_task is not None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(self._answer_task), 20.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+                except Exception:
+                    logger.exception("Last answer failed during stop")
 
-        # Keep /events open through session end so the terminal
-        # session.status_changed and debrief.status_changed still arrive.
-        await self._end_and_debrief()
+            # Keep /events open through session end so the terminal
+            # session.status_changed and debrief.status_changed still arrive.
+            await self._end_and_debrief()
 
-        if self._events is not None:
-            await self._events.stop()
+            if self._events is not None:
+                await self._events.stop()
+        finally:
+            if self._active_stop_task is asyncio.current_task():
+                self._active_stop_task = None
 
     async def shutdown(self) -> None:
         """Cancel everything. Safe to call multiple times."""
@@ -196,6 +201,7 @@ class LiveSessionController:
                 logger.warning("Session end on shutdown failed: %s", exc)
 
         for task in (
+            self._active_stop_task,
             self._answer_task,
             self._audio_task,
             self._events_task,
@@ -317,41 +323,100 @@ class LiveSessionController:
         except asyncio.TimeoutError:
             logger.warning("Events socket not ready; starting audio anyway")
 
+        try:
+            sources = audio_source_channels(self.settings.audio_source)
+        except ValueError as exc:
+            logger.error("Audio configuration error: %s", exc)
+            self.overlay.set_status("audio failed")
+            self.overlay.set_partial(str(exc))
+            return
+
+        if len(sources) == 1:
+            try:
+                outcome = await self._run_audio_channel(sources[0])
+            except Exception as exc:
+                logger.exception("Audio channel %s crashed", sources[0])
+                outcome = AudioOutcome("failed", message=str(exc))
+            self.audio_outcome = outcome
+            self._apply_single_audio_outcome(outcome)
+            return
+
+        task_map = {
+            asyncio.create_task(self._run_audio_channel(s), name=f"audio-{s}"): s
+            for s in sources
+        }
+        outcomes: Dict[str, AudioOutcome] = {}
+        pending = set(task_map.keys())
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    source = task_map[task]
+                    try:
+                        outcomes[source] = task.result()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        msg = str(exc)
+                        if isinstance(exc, RuntimeError) and "not available" in msg.lower():
+                            logger.warning(
+                                "Audio channel %s unavailable: %s", source, msg
+                            )
+                        else:
+                            logger.exception("Audio channel %s crashed", source)
+                        outcomes[source] = AudioOutcome("failed", message=msg)
+                if pending and not self._stop_event.is_set():
+                    self._report_partial_audio(outcomes)
+        except asyncio.CancelledError:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            raise
+
+        self.audio_outcome = outcomes
+        self._apply_multi_audio_outcome(outcomes)
+
+    async def _run_audio_channel(self, source: str) -> AudioOutcome:
         attempt = 0
         while True:
             sender = AudioSender(
                 self.settings,
                 self.session_id or "",
-                on_state_change=self._on_audio_state,
+                source=source,
+                on_state_change=lambda state, s=source: self._on_audio_state(state, s),
             )
             frames = mic_frames(
+                source=source,
                 allow_simulation_fallback=self.settings.simulate_audio,
                 stop_event=self._stop_event,
             )
             try:
-                self.audio_outcome = await sender.run(frames)
+                outcome = await sender.run(frames)
             finally:
                 await frames.aclose()
 
-            outcome = self.audio_outcome
             if outcome is None:
-                return
+                outcome = AudioOutcome("disconnected", message="no outcome")
 
             retryable = (
                 outcome.status == "disconnected"
                 or (outcome.status == "failed" and outcome.retryable)
             )
             if not retryable or attempt >= 1 or self._stop_event.is_set():
-                break
+                return outcome
 
-            # One automatic restart for a transient provider/network failure.
             attempt += 1
-            logger.warning("Restarting audio stream after %s", outcome.status)
+            logger.warning(
+                "Restarting %s audio stream after %s", source, outcome.status
+            )
             self.overlay.set_status("reconnecting audio")
             await self.api.ensure_fresh_token(force=True)
             await asyncio.sleep(AUDIO_RETRY_DELAY_SECONDS)
 
-        outcome = self.audio_outcome
+    def _apply_single_audio_outcome(self, outcome: Optional[AudioOutcome]) -> None:
         if outcome is None:
             return
         if outcome.status == "failed":
@@ -367,6 +432,40 @@ class LiveSessionController:
             self.overlay.set_partial(
                 "Audio stream dropped; press Stop to end or restart the client."
             )
+
+    def _report_partial_audio(self, outcomes: Dict[str, AudioOutcome]) -> None:
+        problems = [
+            f"{s}: {o.error_class or o.status}"
+            for s, o in outcomes.items()
+            if o.status in ("failed", "disconnected")
+        ]
+        if problems:
+            self.overlay.set_status("listening")
+            self.overlay.set_partial(
+                "Audio issue (" + "; ".join(problems) + ") — other source active"
+            )
+
+    def _apply_multi_audio_outcome(self, outcomes: Dict[str, AudioOutcome]) -> None:
+        failed = [
+            f"{s}: {o.error_class or o.status or o.message or 'error'}"
+            for s, o in outcomes.items()
+            if o.status in ("failed", "disconnected")
+        ]
+        ok = [s for s, o in outcomes.items() if o.status in ("closed", "timeout")]
+        if failed and ok:
+            self.overlay.set_status("stopped" if self._stop_event.is_set() else "listening")
+            msg = "Audio issue (" + "; ".join(failed) + ")"
+            if not self._stop_event.is_set():
+                msg += " — other source active"
+            self.overlay.set_partial(msg)
+            return
+        if failed:
+            self.overlay.set_status("audio failed")
+            self.overlay.set_partial("Audio failed (" + "; ".join(failed) + ")")
+            return
+        if self._stop_event.is_set():
+            self.overlay.set_status("stopped")
+            self.overlay.set_partial("Audio closed by backend (mic + system).")
 
     # ------------------------------------------------------------------ events
     async def _on_event(self, event: ServerEvent) -> None:
@@ -443,7 +542,11 @@ class LiveSessionController:
             self.overlay.set_status("unauthorized")
             self.overlay.set_partial("Auth rejected; check DESKTOP_ACCESS_TOKEN")
 
-    def _on_audio_state(self, state: str) -> None:
+    def _on_audio_state(self, state: str, source: str = "") -> None:
+        if self._stopping or self._stop_event.is_set():
+            if state == "finalizing":
+                self.overlay.set_status("finalizing")
+            return
         if state == "streaming":
             self.overlay.set_status("listening")
         elif state == "finalizing":

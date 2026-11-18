@@ -13,11 +13,22 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 API_PREFIX = "/api/v1"
 AUDIO_SOURCES = frozenset({"mic", "loopback"})
+DUAL_AUDIO_SOURCE = "both"
+
+_AUDIO_SOURCE_ALIASES = {
+    "both": "both",
+    "dual": "both",
+    "all": "both",
+    "mic+loopback": "both",
+    "loopback+mic": "both",
+    "mic,loopback": "both",
+    "loopback,mic": "both",
+}
 
 _TRUTHY = {"1", "true", "yes", "on"}
 
@@ -78,6 +89,28 @@ def token_expiring(token: str, within_seconds: float = 120.0) -> bool:
     return exp - time.time() <= within_seconds
 
 
+def normalize_audio_source(source: Optional[str]) -> str:
+    """Normalize an audio source string (``mic``, ``loopback``, or ``both``)."""
+    s = (source or "mic").strip().lower()
+    return _AUDIO_SOURCE_ALIASES.get(s, s)
+
+
+def audio_source_channels(source: Optional[str]) -> list:
+    """Return the concrete capture sources for a setting.
+
+    ``both`` expands to ``["mic", "loopback"]``. Raises ``ValueError`` for an
+    unknown source.
+    """
+    normalized = normalize_audio_source(source)
+    if normalized == DUAL_AUDIO_SOURCE:
+        return ["mic", "loopback"]
+    if normalized in AUDIO_SOURCES:
+        return [normalized]
+    raise ValueError(
+        f"Unknown audio source {source!r}; expected one of mic, loopback, both"
+    )
+
+
 @dataclass
 class Settings:
     api_base_url: str = "http://127.0.0.1:8000"
@@ -98,6 +131,7 @@ class Settings:
             self.ws_base_url = derive_ws_base_url(self.api_base_url)
         self.api_base_url = self.api_base_url.rstrip("/")
         self.ws_base_url = self.ws_base_url.rstrip("/")
+        self.audio_source = normalize_audio_source(self.audio_source)
 
     @property
     def api_v1(self) -> str:
@@ -140,6 +174,6 @@ class Settings:
             simulate_audio=_as_bool(get("DESKTOP_SIMULATE_AUDIO")),
             heartbeat_seconds=float(get("DESKTOP_HEARTBEAT_SECONDS", "20")),
             auto_answer=_as_bool(get("DESKTOP_AUTO_ANSWER")),
-            audio_source=get("DESKTOP_AUDIO_SOURCE", "mic") or "mic",
+            audio_source=normalize_audio_source(get("DESKTOP_AUDIO_SOURCE", "mic") or "mic"),
             request_timeout_seconds=float(get("DESKTOP_REQUEST_TIMEOUT", "30")),
         )

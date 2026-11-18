@@ -20,7 +20,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from qasync import QEventLoop
 
 from desktop_client.audio import mic_frames
-from desktop_client.config import Settings
+from desktop_client.config import Settings, audio_source_channels
 from desktop_client.hotkeys import VK_F8, VK_F9, GlobalHotkeys, TrayIcon
 from desktop_client.overlay import OverlayWindow
 from desktop_client.session import LiveSessionController
@@ -52,37 +52,89 @@ async def stream_audio_to_overlay(
     overlay: OverlayWindow,
     stop_event: asyncio.Event,
     simulate_audio: bool = False,
+    source: str = "mic",
 ):
     """Capture-only loop used when no backend is configured."""
-    frame_count = 0
-    total_bytes = 0
+    sources = audio_source_channels(source)
 
-    try:
+    if len(sources) == 1:
+        frame_count = 0
+        total_bytes = 0
+        try:
+            async for frame in mic_frames(
+                source=sources[0],
+                allow_simulation_fallback=simulate_audio,
+                stop_event=stop_event,
+            ):
+                frame_len = len(frame)
+                frame_count += 1
+                total_bytes += frame_len
+
+                if frame_count == 1:
+                    print(f"captured {frame_len} bytes", flush=True)
+
+                overlay.set_partial(
+                    f"captured {frame_len} bytes "
+                    f"(frame #{frame_count}, total: {total_bytes // 1024} KB)"
+                )
+        except asyncio.CancelledError:
+            logger.info("Audio stream task cancelled")
+            raise
+        except Exception as exc:
+            logger.error("Error in audio stream: %s", exc)
+            overlay.set_status("audio error")
+            overlay.set_partial(f"Audio capture error: {exc}")
+        else:
+            overlay.set_status("stopped")
+            overlay.set_partial("Capture stopped.")
+        return
+
+    counts = {s: {"frames": 0, "bytes": 0} for s in sources}
+    printed = set()
+
+    async def run_one(src: str):
         async for frame in mic_frames(
+            source=src,
             allow_simulation_fallback=simulate_audio,
             stop_event=stop_event,
         ):
-            frame_len = len(frame)
-            frame_count += 1
-            total_bytes += frame_len
+            counts[src]["frames"] += 1
+            counts[src]["bytes"] += len(frame)
+            if src not in printed:
+                print(f"captured {len(frame)} bytes [{src}]", flush=True)
+                printed.add(src)
+            parts = [
+                f"{name} #{v['frames']} ({v['bytes'] // 1024} KB)"
+                for name, v in counts.items()
+            ]
+            overlay.set_partial("captured " + " | ".join(parts))
 
-            if frame_count == 1:
-                print(f"captured {frame_len} bytes", flush=True)
-
-            overlay.set_partial(
-                f"captured {frame_len} bytes "
-                f"(frame #{frame_count}, total: {total_bytes // 1024} KB)"
-            )
+    tasks = [asyncio.create_task(run_one(s), name=f"capture-{s}") for s in sources]
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
+                raise r
+        if any(isinstance(r, asyncio.CancelledError) for r in results):
+            raise asyncio.CancelledError
+        overlay.set_status("stopped")
+        overlay.set_partial("Capture stopped.")
     except asyncio.CancelledError:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         logger.info("Audio stream task cancelled")
         raise
     except Exception as exc:
+        stop_event.set()
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         logger.error("Error in audio stream: %s", exc)
         overlay.set_status("audio error")
         overlay.set_partial(f"Audio capture error: {exc}")
-    else:
-        overlay.set_status("stopped")
-        overlay.set_partial("Capture stopped.")
 
 
 async def async_main(app: QApplication, settings: Settings, *, use_tray: bool = True,
@@ -121,7 +173,9 @@ async def async_main(app: QApplication, settings: Settings, *, use_tray: bool = 
         )
         overlay.stop_requested.connect(local_stop.set)
         audio_task = asyncio.create_task(
-            stream_audio_to_overlay(overlay, local_stop, settings.simulate_audio)
+            stream_audio_to_overlay(
+                overlay, local_stop, settings.simulate_audio, settings.audio_source
+            )
         )
 
     hotkeys = None
@@ -192,6 +246,10 @@ def build_settings(args) -> Settings:
 
 
 def main(argv=None):
+    import signal
+
+    from PySide6.QtCore import QTimer
+
     parser = argparse.ArgumentParser(description="PySide6 live interview overlay")
     parser.add_argument(
         "--simulate-audio",
@@ -224,16 +282,63 @@ def main(argv=None):
 
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(
-            async_main(
-                app,
-                settings,
-                use_tray=not args.no_tray,
-                use_hotkeys=not args.no_hotkeys,
-            )
+
+    # Qt can block Python's signal handling on Windows; a timer keeps the
+    # interpreter responsive so Ctrl+C is delivered promptly.
+    sig_timer = QTimer()
+    sig_timer.start(250)
+    sig_timer.timeout.connect(lambda: None)
+
+    task = loop.create_task(
+        async_main(
+            app,
+            settings,
+            use_tray=not args.no_tray,
+            use_hotkeys=not args.no_hotkeys,
         )
+    )
+
+    def _sigint(*_):
+        logger.info("SIGINT received; closing")
+        try:
+            app.closeAllWindows()
+        except Exception:
+            pass
+
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, _sigint)
+
+    try:
+        loop.run_until_complete(task)
+    except KeyboardInterrupt:
+        logger.info("Interrupted; shutting down")
+        try:
+            app.closeAllWindows()
+        except Exception:
+            pass
+        try:
+            loop.run_until_complete(asyncio.wait_for(asyncio.shield(task), timeout=15))
+        except Exception:
+            if not task.done():
+                task.cancel()
+                try:
+                    loop.run_until_complete(task)
+                except (asyncio.CancelledError, Exception):
+                    pass
     finally:
+        signal.signal(signal.SIGINT, previous_sigint)
+        sig_timer.stop()
+        # Best-effort cleanup of any tasks left behind after interruption.
+        try:
+            pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+            for t in pending:
+                t.cancel()
+            if pending:
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+        except Exception:
+            pass
         loop.close()
 
 

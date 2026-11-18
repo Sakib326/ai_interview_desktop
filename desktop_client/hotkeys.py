@@ -51,7 +51,7 @@ class _WindowsHotkeyFilter(QObject):
                         if callback is not None:
                             callback()
                             return True, 0
-                except Exception:  # pragma: no cover - never crash the event loop
+                except (Exception, KeyboardInterrupt):  # pragma: no cover - never crash the event loop
                     logger.debug("Hotkey filter error", exc_info=True)
                 return False, 0
 

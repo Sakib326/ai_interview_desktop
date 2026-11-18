@@ -484,6 +484,45 @@ async def test_audio_does_not_restart_after_user_stop(qapp, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_audio_uses_configured_source(qapp, monkeypatch):
+    import desktop_client.session as session_module
+    from desktop_client.audio_ws import AudioOutcome
+
+    api = FakeApi()
+    controller, _ = make_controller(qapp, api, audio_source="loopback")
+    controller.session_id = "s1"
+    controller._events_ready.set()
+
+    captured = {}
+
+    class _Sender:
+        def __init__(self, settings, session_id, source=None, on_state_change=None):
+            captured["sender_source"] = settings.audio_source
+            captured["sender_channel"] = source
+
+        async def run(self, frames):
+            return AudioOutcome("closed")
+
+    def _frames(*args, **kwargs):
+        captured["frame_source"] = kwargs.get("source")
+
+        async def _gen():
+            if False:  # pragma: no cover - empty async generator
+                yield b""
+
+        return _gen()
+
+    monkeypatch.setattr(session_module, "AudioSender", _Sender)
+    monkeypatch.setattr(session_module, "mic_frames", _frames)
+
+    await controller._run_audio()
+
+    assert captured["sender_source"] == "loopback"
+    assert captured["sender_channel"] == "loopback"
+    assert captured["frame_source"] == "loopback"
+
+
+@pytest.mark.asyncio
 async def test_transcript_error_renders_as_capture_status(qapp):
     from desktop_client.events import TRANSCRIPT_ERROR
 
