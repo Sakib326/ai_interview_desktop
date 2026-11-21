@@ -293,13 +293,26 @@ class LiveSessionController:
         except ApiError as exc:
             if exc.status_code != 409:
                 raise SessionError(f"Could not create live session: {exc}") from exc
-            # Another session is already pending/active; adopt it instead of failing.
+            # Another session is already pending/active; only adopt a compatible
+            # live session. Adopting a practice session would silently attach the
+            # live overlay to the wrong session kind.
             session = await self.api.active_session()
             if not session:
                 raise SessionError(f"Could not create live session: {exc}") from exc
-            if session.get("status") == "pending" and session.get("kind") == "live":
+            if session.get("kind") != "live":
+                raise SessionError(
+                    f"Cannot start live session: active {session.get('kind')} "
+                    f"session {session.get('id')} exists. End it before starting a "
+                    "live session."
+                )
+            if session.get("status") == "pending":
                 await self.api.acknowledge(session["id"], version)
                 session = await self.api.get_session(session["id"])
+            if session.get("status") != "active":
+                raise SessionError(
+                    f"Cannot adopt session {session.get('id')}: status is "
+                    f"'{session.get('status')}', not active"
+                )
             return session
 
     def _apply_preflight(self, preflight: Dict[str, Any]) -> None:

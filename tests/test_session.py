@@ -168,7 +168,7 @@ async def test_render_partial_and_final_then_speaker_refresh(qapp):
             3,
         )
     )
-    assert overlay.partial_label.text() == ""
+    assert overlay.partial_label.text() == "Listening for speech…"
 
     await asyncio.sleep(0.05)
     assert overlay.transcript_edit.toPlainText() == (

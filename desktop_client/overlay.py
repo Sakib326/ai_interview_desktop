@@ -205,10 +205,16 @@ class OverlayWindow(QWidget):
         self.answer_edit.hide()
         main_layout.addWidget(self.answer_edit, stretch=1)
 
-        # Separate QLabel for mutable partials to prevent full-text reflow on every delta
+        # Live caption: shows streaming STT partials immediately so text appears
+        # before end-of-turn finalization.
         self.partial_label = QLabel(self)
         self.partial_label.setWordWrap(True)
-        self.partial_label.setStyleSheet("color: #9ca3af; font-size: 12px; font-style: italic; background: transparent;")
+        self.partial_label.setStyleSheet(
+            "color: #fbbf24; font-size: 15px; font-weight: 600; "
+            "background: rgba(251, 191, 36, 0.08); border-radius: 6px; "
+            "padding: 6px 8px;"
+        )
+        self.partial_label.setText("Listening for speech…")
         main_layout.addWidget(self.partial_label)
 
         # ---------------- 3. Controls Row ----------------
@@ -389,7 +395,8 @@ class OverlayWindow(QWidget):
 
     def set_partial(self, text: str):
         """Update mutable partial transcript line."""
-        self.partial_label.setText(text)
+        value = (text or "").strip()
+        self.partial_label.setText(value or "Listening for speech…")
 
     def set_status(self, text: str):
         """Set the status row text."""
