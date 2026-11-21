@@ -32,6 +32,7 @@ logging.basicConfig(
 logger = logging.getLogger("desktop_client.main")
 
 VK_F10 = 0x79
+VK_F11 = 0x7A
 
 
 def _confirm_forget_memory(controller) -> None:
@@ -190,6 +191,11 @@ async def async_main(app: QApplication, settings: Settings, *, use_tray: bool = 
                     if controller is not None
                     else (lambda: None)
                 ),
+                VK_F11: (
+                    controller.capture_artifact
+                    if controller is not None
+                    else (lambda: None)
+                ),
             },
         )
         hotkeys.register()
@@ -199,6 +205,7 @@ async def async_main(app: QApplication, settings: Settings, *, use_tray: bool = 
         extra_actions = []
         if controller is not None:
             extra_actions = [
+                ("Capture screen artifact (F11)", controller.capture_artifact),
                 ("Forget all memory\u2026", lambda: _confirm_forget_memory(controller)),
                 (
                     "Retry memory extraction",

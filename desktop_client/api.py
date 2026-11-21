@@ -8,6 +8,7 @@ fields.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from typing import Any, AsyncIterator, Dict, Optional, Tuple
@@ -312,6 +313,27 @@ class ApiClient:
                     yield event_type, payload
         except httpx.HTTPError as exc:
             raise ApiError(0, "network_error", str(exc), retryable=True) from exc
+
+    # ---------------------------------------------------------------- artifacts
+    async def solve_artifact(
+        self,
+        session_id: str,
+        *,
+        image_bytes: Optional[bytes] = None,
+        extracted_text: Optional[str] = None,
+        auto_capture: bool = False,
+    ) -> Dict[str, Any]:
+        """Submit a screen capture (or already-extracted text) as an artifact.
+
+        The backend classifies the text into an artifact type and publishes
+        ``artifact.extracted``; the image itself is never retained.
+        """
+        body: Dict[str, Any] = {"auto_capture": auto_capture}
+        if extracted_text:
+            body["extracted_text"] = extracted_text
+        if image_bytes:
+            body["image_base64"] = base64.b64encode(image_bytes).decode("ascii")
+        return await self._request("POST", f"/sessions/{session_id}/solve", json=body)
 
     # ------------------------------------------------------------------ debrief
     async def debrief_status(self, session_id: str) -> Dict[str, Any]:

@@ -29,6 +29,11 @@ contract audit, live-run evidence, and the remaining server-side gaps.
 - **Stealth:** best-effort screen-share exclusion via
   `SetWindowDisplayAffinity`. Windows only; not a guarantee. See
   `initialize-plan.md` §10.
+- **Artifacts:** press **F11** (or the tray item) to capture the screen and POST
+  it to `/sessions/{id}/solve`. The backend OCRs and classifies the text
+  (`code`, `sql`, `error`, `design`, `problem_statement`, `notes`); the overlay
+  shows the extracted text. The image is never stored — the backend keeps only
+  the text plus a SHA-256 fingerprint.
 - **No TTS.** The overlay is display-only.
 
 ---
@@ -97,6 +102,7 @@ Global (Windows `RegisterHotKey`, work while another app has focus):
 - **F8** — toggle click-through
 - **F9** — toggle stealth exclusion
 - **F10** — answer the latest transcript turn
+- **F11** — capture the screen as a session artifact
 
 The tray menu mirrors these plus show/hide, Stop, and Quit. The tray exists
 because click-through mode cannot be clicked out of: the overlay itself stops

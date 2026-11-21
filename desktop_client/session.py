@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional
 from desktop_client.api import ApiClient, ApiError
 from desktop_client.audio import mic_frames
 from desktop_client.audio_ws import AudioOutcome, AudioSender
+from desktop_client.capture import CaptureError, grab_screen_png
 from desktop_client.config import Settings, audio_source_channels
 from desktop_client.events import (
     DEBRIEF_STATUS_CHANGED,
@@ -815,6 +816,40 @@ class LiveSessionController:
         items = data.get("items") or []
         total = data.get("total", len(items))
         self.overlay.set_partial(f"memory: {total} item(s)")
+
+    # ---------------------------------------------------------------- artifacts
+    def capture_artifact(self) -> None:
+        """Capture the screen and submit it as a session artifact (F11)."""
+        if not self.session_id:
+            self.overlay.set_partial("No session to capture an artifact for.")
+            return
+        asyncio.create_task(self._capture_artifact())
+
+    async def _capture_artifact(self) -> None:
+        try:
+            image = grab_screen_png()
+        except CaptureError as exc:
+            logger.warning("Screen capture failed: %s", exc)
+            self.overlay.set_partial(f"Screen capture failed: {exc}")
+            return
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Unexpected screen capture error")
+            self.overlay.set_partial(f"Screen capture failed: {exc}")
+            return
+
+        self.overlay.set_partial("capturing screen\u2026")
+        try:
+            result = await self.api.solve_artifact(
+                self.session_id, image_bytes=image, auto_capture=False
+            )
+        except ApiError as exc:
+            logger.warning("Artifact submit failed: %s", exc)
+            self.overlay.set_partial(f"artifact failed: {exc.code}")
+            return
+
+        artifact_type = result.get("artifact_type") or "artifact"
+        self.overlay.set_partial(f"artifact: {artifact_type}")
+        self.overlay.set_answer(result.get("content") or "", title=f"artifact ({artifact_type})")
 
     # ------------------------------------------------------------ memory actions
     async def forget_all_memory(self) -> None:

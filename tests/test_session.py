@@ -50,6 +50,14 @@ class FakeApi:
         self.retried_memory = 0
         self.refreshed = 0
         self.closed = False
+        self.artifact_calls = []
+        self.artifact_result = {
+            "artifact_id": "a1",
+            "artifact_type": "code",
+            "content": "def solve():\n    return 42",
+            "confidence": 0.0,
+            "source_mode": "manual",
+        }
 
     async def refresh_token(self):
         self.refreshed += 1
@@ -88,6 +96,18 @@ class FakeApi:
     async def transcript(self, session_id):
         self.transcript_calls += 1
         return self.transcript_turns
+
+    async def solve_artifact(self, session_id, *, image_bytes=None,
+                             extracted_text=None, auto_capture=False):
+        self.artifact_calls.append({
+            "session_id": session_id,
+            "bytes": len(image_bytes or b""),
+            "text": extracted_text,
+            "auto": auto_capture,
+        })
+        if isinstance(self.artifact_result, Exception):
+            raise self.artifact_result
+        return self.artifact_result
 
     async def answer(self, session_id, question_turn_id, candidate_turn_id=None,
                      *, gated=False):
@@ -678,3 +698,81 @@ async def test_start_rejects_unknown_audio_source(qapp):
     controller, _ = make_controller(qapp, audio_source="screen")
     with pytest.raises(SessionError):
         await controller.start()
+
+
+@pytest.mark.asyncio
+async def test_capture_artifact_posts_screen_and_renders_content(qapp, monkeypatch):
+    from desktop_client import session as session_module
+
+    monkeypatch.setattr(session_module, "grab_screen_png", lambda *a, **k: b"\x89PNG fake")
+
+    api = FakeApi()
+    controller, overlay = make_controller(qapp, api)
+    controller.session_id = "s1"
+
+    await controller._capture_artifact()
+
+    assert api.artifact_calls == [
+        {"session_id": "s1", "bytes": 9, "text": None, "auto": False}
+    ]
+    assert overlay.answer_edit.toPlainText() == "def solve():\n    return 42"
+    assert overlay.answer_header.text() == "artifact (code)"
+    assert "artifact: code" in overlay.partial_label.text()
+
+
+@pytest.mark.asyncio
+async def test_capture_artifact_reports_capture_failure(qapp, monkeypatch):
+    from desktop_client import session as session_module
+    from desktop_client.capture import CaptureError
+
+    def _boom(*args, **kwargs):
+        raise CaptureError("no screen")
+
+    monkeypatch.setattr(session_module, "grab_screen_png", _boom)
+
+    api = FakeApi()
+    controller, overlay = make_controller(qapp, api)
+    controller.session_id = "s1"
+
+    await controller._capture_artifact()
+
+    assert api.artifact_calls == []
+    assert "Screen capture failed" in overlay.partial_label.text()
+
+
+@pytest.mark.asyncio
+async def test_capture_artifact_surfaces_api_error(qapp, monkeypatch):
+    from desktop_client import session as session_module
+    from desktop_client.api import ApiError
+
+    monkeypatch.setattr(session_module, "grab_screen_png", lambda *a, **k: b"png")
+
+    api = FakeApi()
+    api.artifact_result = ApiError(
+        503, "ocr_unavailable", "Tesseract missing", retryable=False
+    )
+    controller, overlay = make_controller(qapp, api)
+    controller.session_id = "s1"
+
+    await controller._capture_artifact()
+
+    assert len(api.artifact_calls) == 1
+    assert "ocr_unavailable" in overlay.partial_label.text()
+
+
+@pytest.mark.asyncio
+async def test_capture_artifact_without_session_does_nothing(qapp, monkeypatch):
+    from desktop_client import session as session_module
+
+    called = []
+    monkeypatch.setattr(
+        session_module, "grab_screen_png", lambda *a, **k: called.append(1) or b"png"
+    )
+
+    api = FakeApi()
+    controller, overlay = make_controller(qapp, api)
+    controller.capture_artifact()
+
+    assert called == []
+    assert api.artifact_calls == []
+    assert "No session" in overlay.partial_label.text()
