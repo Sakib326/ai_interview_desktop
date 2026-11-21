@@ -51,6 +51,24 @@ class FakeApi:
         self.refreshed = 0
         self.closed = False
         self.artifact_calls = []
+        self.artifact_answer_calls = []
+        self.artifact_answer_events = [
+            (
+                "assistant.answer_token",
+                {"payload": {"answer_text_delta": "def solve():"}},
+            ),
+            (
+                "assistant.answer_done",
+                {
+                    "payload": {
+                        "validated_object": {
+                            "answer_text": "def solve():\n    return 42",
+                            "artifact_kind": "code",
+                        }
+                    }
+                },
+            ),
+        ]
         self.artifact_result = {
             "artifact_id": "a1",
             "artifact_type": "code",
@@ -108,6 +126,11 @@ class FakeApi:
         if isinstance(self.artifact_result, Exception):
             raise self.artifact_result
         return self.artifact_result
+
+    async def answer_artifact(self, session_id, artifact_id):
+        self.artifact_answer_calls.append((session_id, artifact_id))
+        for event in self.artifact_answer_events:
+            yield event
 
     async def answer(self, session_id, question_turn_id, candidate_turn_id=None,
                      *, gated=False):
@@ -715,8 +738,9 @@ async def test_capture_artifact_posts_screen_and_renders_content(qapp, monkeypat
     assert api.artifact_calls == [
         {"session_id": "s1", "bytes": 9, "text": None, "auto": False}
     ]
+    assert api.artifact_answer_calls == [("s1", "a1")]
     assert overlay.answer_edit.toPlainText() == "def solve():\n    return 42"
-    assert overlay.answer_header.text() == "artifact (code)"
+    assert overlay.answer_header.text() == "answer (code)"
     assert "artifact: code" in overlay.partial_label.text()
 
 

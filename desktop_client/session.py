@@ -847,9 +847,50 @@ class LiveSessionController:
             self.overlay.set_partial(f"artifact failed: {exc.code}")
             return
 
+        artifact_id = result.get("artifact_id")
         artifact_type = result.get("artifact_type") or "artifact"
-        self.overlay.set_partial(f"artifact: {artifact_type}")
-        self.overlay.set_answer(result.get("content") or "", title=f"artifact ({artifact_type})")
+        self.overlay.set_partial(f"artifact: {artifact_type} \u2014 answering\u2026")
+
+        if not artifact_id:
+            self.overlay.set_answer(
+                result.get("content") or "", title=f"artifact ({artifact_type})"
+            )
+            return
+
+        await self._stream_artifact_answer(artifact_id, artifact_type)
+
+    async def _stream_artifact_answer(self, artifact_id: str, artifact_type: str) -> None:
+        """Stream the LLM answer for a captured artifact into the answer pane."""
+        self.overlay.set_answer_loading()
+        self.overlay.answer_header.setText(f"answer ({artifact_type})")
+        accumulated = []
+        try:
+            async for event_type, envelope in self.api.answer_artifact(
+                self.session_id or "", artifact_id
+            ):
+                payload = envelope.get("payload", envelope)
+                if event_type == "assistant.answer_token":
+                    delta = str(payload.get("answer_text_delta") or "")
+                    if delta:
+                        accumulated.append(delta)
+                        self.overlay.append_answer_token(delta)
+                elif event_type == "assistant.answer_done":
+                    validated = payload.get("validated_object") or {}
+                    final_text = validated.get("answer_text") or "".join(accumulated)
+                    self.overlay.set_answer(final_text, title=f"answer ({artifact_type})")
+                    self.overlay.set_partial(f"artifact: {artifact_type}")
+                elif event_type == "assistant.answer_failed":
+                    message = str(
+                        payload.get("error_class") or "answer failed"
+                    )
+                    self.overlay.set_answer_error(
+                        f"{message}", bool(payload.get("retryable", False))
+                    )
+                    self.overlay.set_partial(f"artifact answer failed: {message}")
+        except ApiError as exc:
+            logger.warning("Artifact answer failed: %s", exc)
+            self.overlay.set_answer_error(f"{exc.code}: {exc.message}", exc.retryable)
+            self.overlay.set_partial(f"artifact answer failed: {exc.code}")
 
     # ------------------------------------------------------------ memory actions
     async def forget_all_memory(self) -> None:

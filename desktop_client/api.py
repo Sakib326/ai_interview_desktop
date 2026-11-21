@@ -335,6 +335,30 @@ class ApiClient:
             body["image_base64"] = base64.b64encode(image_bytes).decode("ascii")
         return await self._request("POST", f"/sessions/{session_id}/solve", json=body)
 
+    async def answer_artifact(
+        self, session_id: str, artifact_id: str
+    ) -> AsyncIterator[Tuple[str, Dict[str, Any]]]:
+        """Stream the LLM answer generated for a captured artifact."""
+        url = f"/sessions/{session_id}/artifacts/{artifact_id}/answer"
+        headers = {"Accept": "text/event-stream"}
+        try:
+            async with self._client.stream(
+                "POST", url, headers=headers, timeout=120.0
+            ) as response:
+                if response.status_code >= 400:
+                    await response.aread()
+                    try:
+                        payload = response.json()
+                    except ValueError:
+                        payload = None
+                    raise _error_from_response(response, payload)
+                async for event_type, payload in parse_sse_stream(
+                    response.aiter_lines()
+                ):
+                    yield event_type, payload
+        except httpx.HTTPError as exc:
+            raise ApiError(0, "network_error", str(exc), retryable=True) from exc
+
     # ------------------------------------------------------------------ debrief
     async def debrief_status(self, session_id: str) -> Dict[str, Any]:
         return await self._request("GET", f"/sessions/{session_id}/debrief/status")
