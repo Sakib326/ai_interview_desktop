@@ -851,6 +851,14 @@ class LiveSessionController:
         artifact_type = result.get("artifact_type") or "artifact"
         self.overlay.set_partial(f"artifact: {artifact_type} \u2014 answering\u2026")
 
+        # A vision read already produced the solution inside the /solve call,
+        # so render it directly instead of opening a second stream for it.
+        solution = (result.get("solution_text") or "").strip()
+        if solution:
+            self.overlay.set_answer(solution, title=f"answer ({artifact_type})")
+            self.overlay.set_partial(f"artifact: {artifact_type}")
+            return
+
         if not artifact_id:
             self.overlay.set_answer(
                 result.get("content") or "", title=f"artifact ({artifact_type})"

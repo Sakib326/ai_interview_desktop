@@ -327,6 +327,12 @@ class ApiClient:
 
         The backend classifies the text into an artifact type and publishes
         ``artifact.extracted``; the image itself is never retained.
+
+        When the backend reads the capture with a vision model, the response
+        also carries ``solution_text`` with ``extraction_method == "vision"``.
+        Render it directly and skip ``answer_artifact`` — the backend already
+        solved the capture in the same call. Without it (OCR path) call
+        ``answer_artifact`` to stream the answer.
         """
         body: Dict[str, Any] = {"auto_capture": auto_capture}
         if extracted_text:

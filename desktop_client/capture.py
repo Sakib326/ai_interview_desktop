@@ -2,7 +2,8 @@
 
 Uses ``QScreen.grabWindow(0)`` from PySide6, so no extra dependency is needed.
 Captures the primary screen as PNG bytes for ``POST /sessions/{id}/solve``;
-the backend owns OCR and artifact classification.
+the backend owns screen reading (direct vision or OCR) and artifact
+classification.
 """
 
 from __future__ import annotations

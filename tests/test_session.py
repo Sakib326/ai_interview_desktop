@@ -745,6 +745,66 @@ async def test_capture_artifact_posts_screen_and_renders_content(qapp, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_capture_artifact_renders_vision_solution_without_second_call(
+    qapp, monkeypatch
+):
+    """A vision capture carries its solution; no /answer stream is opened."""
+    from desktop_client import session as session_module
+
+    monkeypatch.setattr(session_module, "grab_screen_png", lambda *a, **k: b"\x89PNG fake")
+
+    api = FakeApi()
+    api.artifact_result = {
+        "artifact_id": "a1",
+        "artifact_type": "problem_statement",
+        "content": "Given nums, return the sum.",
+        "confidence": 0.93,
+        "source_mode": "manual",
+        "extraction_method": "vision",
+        "solution_text": "Use sum(nums) - O(n) time.",
+    }
+    controller, overlay = make_controller(qapp, api)
+    controller.session_id = "s1"
+
+    await controller._capture_artifact()
+
+    # One round trip: the solution from /solve is rendered directly.
+    assert api.artifact_answer_calls == []
+    assert overlay.answer_edit.toPlainText() == "Use sum(nums) - O(n) time."
+    assert overlay.answer_header.text() == "answer (problem_statement)"
+    # The partial line must not keep saying "answering..." once the answer is up.
+    assert overlay.partial_label.text() == "artifact: problem_statement"
+
+
+@pytest.mark.asyncio
+async def test_capture_artifact_falls_back_to_answer_stream_without_solution(
+    qapp, monkeypatch
+):
+    """OCR-only captures have no stored solution, so /answer still streams."""
+    from desktop_client import session as session_module
+
+    monkeypatch.setattr(session_module, "grab_screen_png", lambda *a, **k: b"\x89PNG fake")
+
+    api = FakeApi()
+    api.artifact_result = {
+        "artifact_id": "a1",
+        "artifact_type": "code",
+        "content": "def solve():",
+        "confidence": 0.0,
+        "source_mode": "manual",
+        "extraction_method": "ocr",
+        "solution_text": None,
+    }
+    controller, overlay = make_controller(qapp, api)
+    controller.session_id = "s1"
+
+    await controller._capture_artifact()
+
+    assert api.artifact_answer_calls == [("s1", "a1")]
+    assert overlay.answer_edit.toPlainText() == "def solve():\n    return 42"
+
+
+@pytest.mark.asyncio
 async def test_capture_artifact_reports_capture_failure(qapp, monkeypatch):
     from desktop_client import session as session_module
     from desktop_client.capture import CaptureError
