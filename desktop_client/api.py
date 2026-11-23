@@ -314,6 +314,34 @@ class ApiClient:
         except httpx.HTTPError as exc:
             raise ApiError(0, "network_error", str(exc), retryable=True) from exc
 
+    # --------------------------------------------------------------- transcript
+    async def ingest_transcript_turn(
+        self,
+        session_id: str,
+        *,
+        speaker: str,
+        text: str,
+        segment_id: Optional[str] = None,
+        confidence: Optional[float] = None,
+        started_at: Optional[str] = None,
+        ended_at: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Persist a finalized local-STT turn via the backend ingest contract."""
+        body: Dict[str, Any] = {"speaker": speaker, "text": text}
+        if segment_id is not None:
+            body["segment_id"] = segment_id
+        if confidence is not None:
+            body["confidence"] = confidence
+        if started_at is not None:
+            body["started_at"] = started_at
+        if ended_at is not None:
+            body["ended_at"] = ended_at
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        return await self._request(
+            "POST", f"/sessions/{session_id}/transcript/turns", json=body, headers=headers
+        )
+
     # ---------------------------------------------------------------- artifacts
     async def solve_artifact(
         self,

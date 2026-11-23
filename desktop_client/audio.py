@@ -117,8 +117,8 @@ def _wasapi_loopback_extra(sd):
         return None, False
 
 
-def _find_loopback_input_device(sd):
-    """Return a loopback-capable input device index, if available.
+def _loopback_input_devices(sd):
+    """Return likely loopback input devices, best candidates first.
 
     Prefers explicit WASAPI loopback endpoints, then common loopback/mix inputs
     such as "Stereo Mix", "What U Hear", or virtual cable outputs.
@@ -127,7 +127,7 @@ def _find_loopback_input_device(sd):
         hostapis = sd.query_hostapis()
         devices = sd.query_devices()
     except Exception:
-        return None
+        return []
 
     wasapi_idx = None
     for i, api in enumerate(hostapis):
@@ -155,10 +155,108 @@ def _find_loopback_input_device(sd):
             score += 2
         candidates.append((score, idx))
 
-    if not candidates:
-        return None
     candidates.sort(reverse=True)
-    return candidates[0][1]
+    return [idx for _, idx in candidates]
+
+
+def _log_loopback_device(sd, idx, mode):
+    try:
+        info = sd.query_devices(idx)
+        apis = sd.query_hostapis()
+        api_idx = info.get("hostapi")
+        api_name = apis[api_idx].get("name", "unknown") if api_idx is not None else "unknown"
+        logger.info("Loopback capture selected %s device %s (%s, host API %s)",
+                    mode, idx, info.get("name", "unknown"), api_name)
+    except Exception:
+        logger.info("Loopback capture selected %s device %s", mode, idx)
+
+
+class _SoundCardLoopbackStream:
+    """Adapt SoundCard's WASAPI render loopback recorder to callback streams."""
+
+    def __init__(self, microphone, callback, sample_rate=SAMPLE_RATE):
+        import threading
+
+        self.microphone = microphone
+        self.callback = callback
+        self.sample_rate = sample_rate
+        self.blocksize = max(800, int(sample_rate * FRAME_DURATION_MS / 1000))
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._error = None
+        self._thread = threading.Thread(
+            target=self._run, name="wasapi-loopback", daemon=True
+        )
+
+    def start(self):
+        self._thread.start()
+        if not self._ready.wait(5.0):
+            self.stop()
+            raise RuntimeError("Timed out opening the default WASAPI loopback stream")
+        if self._error is not None:
+            raise RuntimeError(f"Unable to start default WASAPI loopback: {self._error}") from self._error
+        return self
+
+    def _run(self):
+        ole32 = None
+        com_initialized = False
+        try:
+            import ctypes
+            import numpy as np
+
+            ole32 = ctypes.OleDLL("ole32")
+            result = ole32.CoInitializeEx(None, 0)  # COINIT_MULTITHREADED
+            if result < 0:
+                raise OSError(f"CoInitializeEx failed with HRESULT 0x{result & 0xFFFFFFFF:08X}")
+            com_initialized = True
+            with self.microphone.recorder(
+                samplerate=self.sample_rate, channels=2, blocksize=self.blocksize
+            ) as recorder:
+                self._ready.set()
+                while not self._stop.is_set():
+                    samples = recorder.record(numframes=self.blocksize)
+                    if samples is None or not len(samples):
+                        continue
+                    pcm = np.clip(samples, -1.0, 1.0)
+                    pcm = (pcm * 32767.0).astype("<i2", copy=False)
+                    self.callback(
+                        pcm.tobytes(), len(pcm), None, None
+                    )
+        except Exception as exc:
+            self._error = exc
+            self._ready.set()
+            if not self._stop.is_set():
+                logger.exception("Default WASAPI loopback capture stopped")
+        finally:
+            if com_initialized and ole32 is not None:
+                ole32.CoUninitialize()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def close(self):
+        self.stop()
+
+
+def _open_default_wasapi_loopback(callback):
+    """Capture the active default render endpoint through Windows WASAPI."""
+    import soundcard as sc
+
+    speaker = sc.default_speaker()
+    if speaker is None:
+        raise RuntimeError("Windows has no default playback endpoint")
+    microphone = sc.get_microphone(speaker.name, include_loopback=True)
+    if not getattr(microphone, "isloopback", False):
+        raise RuntimeError(f"{speaker.name!r} did not resolve to a loopback endpoint")
+    stream = _SoundCardLoopbackStream(microphone, callback).start()
+    logger.info("Loopback capture selected default WASAPI render endpoint %s", speaker.name)
+    return stream, {
+        "in_rate": SAMPLE_RATE,
+        "in_channels": 2,
+        "state": {"buf": array("h"), "pos": 0.0},
+    }
 
 
 def _open_loopback_stream(sd, sample_rate, channels, dtype, block_size, device, callback):
@@ -170,6 +268,14 @@ def _open_loopback_stream(sd, sample_rate, channels, dtype, block_size, device, 
     """
     if sys.platform != "win32":
         raise RuntimeError("System/loopback audio capture is only supported on Windows")
+
+    # SoundCard uses WASAPI's render-loopback interface, which captures the
+    # actual Windows default output (including Bluetooth/headset endpoints).
+    # Stock sounddevice builds often lack a usable WASAPI loopback flag.
+    try:
+        return _open_default_wasapi_loopback(callback)
+    except Exception as exc:
+        logger.info("Default WASAPI loopback unavailable (%s); trying PortAudio devices", exc)
 
     extra, loopback_flag_ok = _wasapi_loopback_extra(sd)
 
@@ -189,6 +295,7 @@ def _open_loopback_stream(sd, sample_rate, channels, dtype, block_size, device, 
                     extra_settings=extra,
                 )
                 stream.start()
+                _log_loopback_device(sd, out_idx, "WASAPI render")
                 logger.info(
                     "Loopback stream started (direct %d Hz, %d ch, blocksize=%d)",
                     sample_rate,
@@ -217,6 +324,7 @@ def _open_loopback_stream(sd, sample_rate, channels, dtype, block_size, device, 
                     extra_settings=extra,
                 )
                 stream.start()
+                _log_loopback_device(sd, out_idx, "WASAPI render")
                 logger.info(
                     "Loopback stream started (native %d Hz, %d ch -> %d Hz mono)",
                     in_rate,
@@ -234,10 +342,10 @@ def _open_loopback_stream(sd, sample_rate, channels, dtype, block_size, device, 
                 )
 
     # Fallback: use an explicit loopback-capable input device (e.g. Stereo Mix).
-    loop_idx = _find_loopback_input_device(sd)
-    if loop_idx is None and device is not None:
-        loop_idx = device
-    if loop_idx is None:
+    candidates = _loopback_input_devices(sd)
+    if device is not None and device not in candidates:
+        candidates.insert(0, device)
+    if not candidates:
         raise RuntimeError(
             "System/loopback audio capture not available: WASAPI loopback is not "
             "supported by this sounddevice/PortAudio build and no loopback-capable "
@@ -245,53 +353,52 @@ def _open_loopback_stream(sd, sample_rate, channels, dtype, block_size, device, 
             "sound settings or use a virtual audio cable, or update sounddevice."
         )
 
-    try:
-        stream = sd.RawInputStream(
-            samplerate=sample_rate,
-            channels=channels,
-            dtype=dtype,
-            blocksize=block_size,
-            device=loop_idx,
-            callback=callback,
-        )
-        stream.start()
-        logger.info(
-            "Loopback stream started (device %s, %d Hz, %d ch)",
-            loop_idx,
-            sample_rate,
-            channels,
-        )
-        return stream, None
-    except Exception as exc:
-        logger.info("Direct loopback device open failed (%s); trying native format", exc)
+    errors = []
+    for loop_idx in candidates:
+        info = sd.query_devices(loop_idx)
+        in_rate = int(info.get("default_samplerate") or sample_rate)
+        in_channels = int(info.get("max_input_channels") or channels or 2)
+        if in_channels <= 0:
+            continue
+        attempts = [
+            (sample_rate, channels, block_size, None),
+            (in_rate, in_channels,
+             max(1, int(in_rate * (FRAME_DURATION_MS / 1000.0))), {
+                 "in_rate": in_rate,
+                 "in_channels": in_channels,
+                 "state": {"buf": array("h"), "pos": 0.0},
+             }),
+        ]
+        for rate, channel_count, frames, conversion in attempts:
+            stream = None
+            try:
+                stream = sd.RawInputStream(
+                    samplerate=rate,
+                    channels=channel_count,
+                    dtype=dtype,
+                    blocksize=frames,
+                    device=loop_idx,
+                    callback=callback,
+                )
+                stream.start()
+                _log_loopback_device(sd, loop_idx, "input fallback")
+                logger.info(
+                    "Loopback stream started (device %s, %d Hz, %d ch%s)",
+                    loop_idx, rate, channel_count,
+                    " -> 16000 Hz mono" if conversion else "",
+                )
+                return stream, conversion
+            except Exception as exc:
+                errors.append(f"device {loop_idx} at {rate} Hz: {exc}")
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
 
-    info = sd.query_devices(loop_idx)
-    in_rate = int(info.get("default_samplerate") or sample_rate)
-    in_channels = int(info.get("max_input_channels") or channels or 2)
-    if in_channels <= 0:
-        in_channels = 2
-    in_blocksize = max(1, int(in_rate * (FRAME_DURATION_MS / 1000.0)))
-    stream = sd.RawInputStream(
-        samplerate=in_rate,
-        channels=in_channels,
-        dtype=dtype,
-        blocksize=in_blocksize,
-        device=loop_idx,
-        callback=callback,
+    raise RuntimeError(
+        "Unable to open any detected loopback input device: " + "; ".join(errors)
     )
-    stream.start()
-    logger.info(
-        "Loopback stream started (device %s, native %d Hz, %d ch -> %d Hz mono)",
-        loop_idx,
-        in_rate,
-        in_channels,
-        sample_rate,
-    )
-    return stream, {
-        "in_rate": in_rate,
-        "in_channels": in_channels,
-        "state": {"buf": array("h"), "pos": 0.0},
-    }
 
 
 def _open_mic_stream(sd, sample_rate, channels, dtype, blocksize, device, callback):

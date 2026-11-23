@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from typing import Any, Dict, Optional
 
 from desktop_client.api import ApiClient, ApiError
-from desktop_client.audio import mic_frames
+from desktop_client.audio import SAMPLE_RATE, mic_frames
 from desktop_client.audio_ws import AudioOutcome, AudioSender
 from desktop_client.capture import CaptureError, grab_screen_png
 from desktop_client.config import Settings, audio_source_channels
@@ -36,7 +37,12 @@ from desktop_client.events import (
     EventClient,
     ServerEvent,
 )
-from desktop_client.transcript import SPEAKER_INTERVIEWER, TranscriptStore
+from desktop_client.moonshine_stt import (
+    MoonshineCallbacks,
+    MoonshineTranscriberSession,
+    MoonshineUnavailableError,
+)
+from desktop_client.transcript import SPEAKER_CANDIDATE, SPEAKER_INTERVIEWER, TranscriptStore
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +88,9 @@ class LiveSessionController:
         self._answered_turns: set = set()
         self._retry_handler = None
         self._pending_auto_answer: Optional[asyncio.TimerHandle] = None
+        self._moonshine_partials: Dict[str, str] = {}
+        self._moonshine_tasks: list[asyncio.Task] = []
+        self._ingest_tasks: set[asyncio.Task] = set()
         # Backend caches create responses per (user, key) for the process
         # lifetime, so the key must be unique per launch attempt. A constant key
         # would replay the first session of the process (already ended) forever.
@@ -102,6 +111,8 @@ class LiveSessionController:
             audio_source_channels(self.settings.audio_source)
         except ValueError as exc:
             raise SessionError(str(exc)) from exc
+
+        await self._ensure_stt_ready()
 
         session = await self._ensure_session()
         self.session_id = session["id"]
@@ -211,6 +222,8 @@ class LiveSessionController:
             self._audio_task,
             self._events_task,
             self._token_task,
+            *self._moonshine_tasks,
+            *list(self._ingest_tasks),
         ):
             if task is not None and not task.done():
                 task.cancel()
@@ -235,6 +248,58 @@ class LiveSessionController:
 
     async def close(self) -> None:
         await self.shutdown()
+
+    # ----------------------------------------------------------- stt / ingest
+    async def _ensure_stt_ready(self) -> None:
+        """Validate local STT dependencies and backend ingest capability."""
+        if self.settings.stt_provider != "moonshine":
+            return
+        try:
+            from desktop_client.moonshine_stt import _import_moonshine  # noqa: F401
+
+            _import_moonshine()
+        except MoonshineUnavailableError as exc:
+            raise SessionError(str(exc)) from exc
+
+        if not self.settings.configured:
+            return
+        # Probe the endpoint against a non-existent session. A 404 with "Session
+        # not found" means the route exists and ran its ownership check. A 404/405
+        # indicating the route/path is missing means the backend lacks support.
+        try:
+            await self.api.ingest_transcript_turn(
+                "__capability_probe__",
+                speaker=SPEAKER_CANDIDATE,
+                text="capability probe",
+                segment_id="capability-probe",
+                idempotency_key="capability-probe",
+            )
+        except ApiError as exc:
+            detail = (exc.message or "").lower()
+            code = (exc.code or "").lower()
+            route_missing = exc.status_code == 405 or code in {
+                "not_found",
+                "method_not_allowed",
+            }
+            session_probe_hit = "session not found" in detail or "session does not belong" in detail
+            if exc.status_code == 404 and not session_probe_hit:
+                route_missing = True
+            if route_missing:
+                raise SessionError(
+                    "DESKTOP_STT_PROVIDER=moonshine requires backend support for "
+                    "POST /sessions/{id}/transcript/turns. The running backend does "
+                    "not expose it; keep DESKTOP_STT_PROVIDER=backend or update the "
+                    "backend."
+                ) from exc
+            # 401/403/409/422/5xx on a fake session means the route exists but the
+            # probe payload/session is not acceptable; that's enough to proceed.
+            logger.info(
+                "Moonshine ingest capability probe reached backend (%s: %s)",
+                exc.status_code,
+                exc.code,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Moonshine ingest capability probe failed: %s", exc)
 
     # ----------------------------------------------------------- session setup
     async def _ensure_session(self) -> Dict[str, Any]:
@@ -349,6 +414,10 @@ class LiveSessionController:
             self.overlay.set_partial(str(exc))
             return
 
+        if self.settings.stt_provider == "moonshine":
+            await self._run_moonshine_audio(sources)
+            return
+
         if len(sources) == 1:
             try:
                 outcome = await self._run_audio_channel(sources[0])
@@ -434,6 +503,235 @@ class LiveSessionController:
             await self.api.ensure_fresh_token(force=True)
             await asyncio.sleep(AUDIO_RETRY_DELAY_SECONDS)
 
+    async def _run_moonshine_audio(self, sources: list[str]) -> None:
+        callbacks = MoonshineCallbacks(
+            on_partial=self._on_moonshine_partial,
+            on_final=self._on_moonshine_final,
+            on_error=self._on_moonshine_error,
+        )
+        task_map = {
+            asyncio.create_task(
+                self._run_moonshine_channel(source, callbacks),
+                name=f"moonshine-{source}",
+            ): source
+            for source in sources
+        }
+        self._moonshine_tasks = list(task_map.keys())
+        outcomes: Dict[str, AudioOutcome] = {}
+        pending = set(task_map.keys())
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    source = task_map[task]
+                    try:
+                        outcomes[source] = task.result()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.exception("Moonshine channel %s crashed", source)
+                        outcomes[source] = AudioOutcome("failed", message=str(exc))
+                if pending and not self._stop_event.is_set():
+                    self._report_partial_audio(outcomes)
+        except asyncio.CancelledError:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            raise
+        finally:
+            self._moonshine_tasks = []
+
+        self.audio_outcome = outcomes
+        self._apply_multi_audio_outcome(outcomes)
+
+    async def _run_moonshine_channel(
+        self, source: str, callbacks: MoonshineCallbacks
+    ) -> AudioOutcome:
+        transcriber = MoonshineTranscriberSession(
+            source=source,
+            sample_rate=SAMPLE_RATE,
+            model_path=self.settings.moonshine_model,
+            language=self.settings.moonshine_language,
+            callbacks=callbacks,
+        )
+        frames = mic_frames(
+            source=source,
+            allow_simulation_fallback=self.settings.simulate_audio,
+            stop_event=self._stop_event,
+        )
+        fed_frames = 0
+        fed_bytes = 0
+        last_log = asyncio.get_running_loop().time()
+        rms_last = 0.0
+        rms_max = 0.0
+        debug_dump_path = os.getenv("DESKTOP_DEBUG_AUDIO_DUMP", "").strip()
+        debug_dump_file = None
+        debug_dump_bytes = 0
+        debug_dump_limit = int(os.getenv("DESKTOP_DEBUG_AUDIO_DUMP_SECONDS", "15")) * SAMPLE_RATE * 2
+        try:
+            self._on_audio_state("streaming", source)
+            await transcriber.start()
+            async for frame in frames:
+                if not frame:
+                    continue
+                await transcriber.feed(frame)
+                fed_frames += 1
+                fed_bytes += len(frame)
+                # Quick RMS for diagnosing silence/wrong device.
+                try:
+                    from array import array as _array
+
+                    samples = _array("h")
+                    samples.frombytes(bytes(frame))
+                    if samples:
+                        mean_sq = sum(s * s for s in samples) / len(samples)
+                        rms_last = mean_sq ** 0.5
+                        if rms_last > rms_max:
+                            rms_max = rms_last
+                except Exception:
+                    pass
+                if debug_dump_path and debug_dump_bytes < debug_dump_limit:
+                    try:
+                        import wave as _wave
+
+                        if debug_dump_file is None:
+                            os.makedirs(os.path.dirname(debug_dump_path) or ".", exist_ok=True)
+                            debug_dump_file = _wave.open(debug_dump_path, "wb")
+                            debug_dump_file.setnchannels(1)
+                            debug_dump_file.setsampwidth(2)
+                            debug_dump_file.setframerate(SAMPLE_RATE)
+                            logger.info("[moonshine:%s] dumping debug audio to %s", source, debug_dump_path)
+                        debug_dump_file.writeframes(bytes(frame))
+                        debug_dump_bytes += len(frame)
+                        if debug_dump_bytes >= debug_dump_limit:
+                            debug_dump_file.close()
+                            debug_dump_file = None
+                            logger.info("[moonshine:%s] debug audio dump complete: %s", source, debug_dump_path)
+                    except Exception:
+                        logger.exception("[moonshine:%s] debug audio dump failed", source)
+                        debug_dump_path = ""
+                now = asyncio.get_running_loop().time()
+                if now - last_log >= 5.0:
+                    logger.info(
+                        "[moonshine:%s] fed frames=%d bytes=%d (%.1fs audio) rms_last=%.1f rms_max=%.1f state=%s",
+                        source, fed_frames, fed_bytes, fed_frames * 0.05,
+                        rms_last, rms_max, transcriber.debug_state(),
+                    )
+                    last_log = now
+            self._on_audio_state("finalizing", source)
+            await transcriber.stop()
+            if self._stop_event.is_set():
+                return AudioOutcome("closed")
+            return AudioOutcome("disconnected", message="capture ended")
+        except asyncio.CancelledError:
+            try:
+                await transcriber.stop()
+            except Exception:
+                logger.debug("Moonshine stop during cancel failed", exc_info=True)
+            raise
+        except MoonshineUnavailableError as exc:
+            logger.error("Moonshine unavailable for %s: %s", source, exc)
+            return AudioOutcome("failed", message=str(exc))
+        except Exception as exc:
+            logger.exception("Moonshine channel %s failed", source)
+            return AudioOutcome("failed", message=str(exc))
+        finally:
+            try:
+                if debug_dump_file is not None:
+                    debug_dump_file.close()
+            except Exception:
+                pass
+            await frames.aclose()
+            logger.info(
+                "[moonshine:%s] channel finished fed_frames=%d fed_bytes=%d rms_max=%.1f",
+                source, fed_frames, fed_bytes, rms_max,
+            )
+
+    def _on_moonshine_partial(self, source: str, segment_id: str, text: str) -> None:
+        if self._stopping or self._stop_event.is_set():
+            return
+        logger.info("[moonshine:%s] partial seg=%s text=%r", source, segment_id, text[:80])
+        self._moonshine_partials[f"{source}:{segment_id}"] = text
+        # Keep the overlay partial simple: show the most recent partial.
+        self.overlay.set_partial(text)
+
+    def _on_moonshine_error(self, source: str, exc: Exception) -> None:
+        logger.warning("[moonshine:%s] error: %s", source, exc)
+        self.overlay.set_partial(f"local STT ({source}) error: {exc}")
+
+    def _on_moonshine_final(
+        self, source: str, segment_id: str, text: str, confidence: Optional[float]
+    ) -> None:
+        if self._stopping or self._stop_event.is_set():
+            return
+        logger.info(
+            "[moonshine:%s] final seg=%s conf=%s text=%r",
+            source, segment_id, confidence, text[:120],
+        )
+        self._moonshine_partials.pop(f"{source}:{segment_id}", None)
+        speaker = SPEAKER_INTERVIEWER if source == "loopback" else SPEAKER_CANDIDATE
+        task = asyncio.create_task(
+            self._ingest_moonshine_final(source, speaker, segment_id, text, confidence),
+            name=f"ingest-{source}-{segment_id}",
+        )
+        self._ingest_tasks.add(task)
+        task.add_done_callback(self._ingest_tasks.discard)
+
+    async def _ingest_moonshine_final(
+        self,
+        source: str,
+        speaker: str,
+        segment_id: str,
+        text: str,
+        confidence: Optional[float],
+    ) -> None:
+        if not self.session_id:
+            return
+        try:
+            result = await self.api.ingest_transcript_turn(
+                self.session_id,
+                speaker=speaker,
+                text=text,
+                segment_id=segment_id,
+                confidence=confidence,
+                idempotency_key=f"moonshine-{self.session_id}-{segment_id}",
+            )
+        except ApiError as exc:
+            logger.warning("Moonshine transcript ingest failed: %s", exc)
+            self.overlay.set_status("transcription error")
+            self.overlay.set_partial(f"Local STT ingest failed: {exc.code}")
+            return
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Moonshine transcript ingest crashed")
+            self.overlay.set_status("transcription error")
+            self.overlay.set_partial(f"Local STT ingest failed: {exc}")
+            return
+
+        if result.get("duplicate"):
+            return
+
+        payload = {
+            "turn_id": result.get("turn_id"),
+            "text": result.get("text") or text,
+            "sequence_number": result.get("sequence_number"),
+            "segment_id": result.get("segment_id") or segment_id,
+            "speaker": result.get("speaker") or speaker,
+        }
+        turn = self.transcript.apply_final(payload)
+        if turn is not None:
+            self._render_transcript()
+            if (
+                self.settings.auto_answer
+                and turn.speaker == SPEAKER_INTERVIEWER
+            ):
+                self._schedule_auto_answer(
+                    turn.turn_id,
+                    self.transcript.candidate_turn_id_before(turn.sequence_number),
+                )
+
     def _apply_single_audio_outcome(self, outcome: Optional[AudioOutcome]) -> None:
         if outcome is None:
             return
@@ -483,7 +781,8 @@ class LiveSessionController:
             return
         if self._stop_event.is_set():
             self.overlay.set_status("stopped")
-            self.overlay.set_partial("Audio closed by backend (mic + system).")
+            label = "local STT" if self.settings.stt_provider == "moonshine" else "backend"
+            self.overlay.set_partial(f"Audio closed ({label}, mic + system).")
 
     # ------------------------------------------------------------------ events
     async def _on_event(self, event: ServerEvent) -> None:
@@ -590,7 +889,10 @@ class LiveSessionController:
 
     def _render_transcript(self) -> None:
         self.overlay.set_turns(self.transcript.rendered_turns())
-        self.overlay.set_partial(self.transcript.partial_text)
+        partial = self.transcript.partial_text
+        if not partial and self._moonshine_partials:
+            partial = next(reversed(self._moonshine_partials.values()))
+        self.overlay.set_partial(partial)
 
     # ----------------------------------------------------------------- answers
     def _cancel_pending_auto_answer(self) -> None:

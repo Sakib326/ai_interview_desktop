@@ -315,3 +315,50 @@ async def test_401_without_refresh_credentials_raises():
         await client.aclose()
     assert excinfo.value.status_code == 401
     assert excinfo.value.code == "unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_ingest_transcript_turn_posts_expected_payload():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["method"] = request.method
+        captured["body"] = json.loads(request.content)
+        captured["idempotency"] = request.headers.get("Idempotency-Key")
+        return httpx.Response(
+            200,
+            json={
+                "session_id": "s1",
+                "turn_id": "t1",
+                "sequence_number": 3,
+                "speaker": "candidate",
+                "segment_id": "seg-1",
+                "duplicate": False,
+                "text": "hello",
+            },
+        )
+
+    client = ApiClient(make_settings(), transport=httpx.MockTransport(handler))
+    try:
+        result = await client.ingest_transcript_turn(
+            "s1",
+            speaker="candidate",
+            text="hello",
+            segment_id="seg-1",
+            confidence=0.9,
+            idempotency_key="idem-1",
+        )
+    finally:
+        await client.aclose()
+
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/api/v1/sessions/s1/transcript/turns"
+    assert captured["idempotency"] == "idem-1"
+    assert captured["body"] == {
+        "speaker": "candidate",
+        "text": "hello",
+        "segment_id": "seg-1",
+        "confidence": 0.9,
+    }
+    assert result["turn_id"] == "t1"

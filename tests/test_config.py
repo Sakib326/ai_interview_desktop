@@ -56,9 +56,13 @@ def test_settings_load_reads_env_file(tmp_path, monkeypatch):
     for key in (
         "DESKTOP_ACCESS_TOKEN",
         "DESKTOP_API_BASE_URL",
+        "DESKTOP_WS_BASE_URL",
         "DESKTOP_GOAL_ID",
         "DESKTOP_AUTO_ANSWER",
         "DESKTOP_SIMULATE_AUDIO",
+        "DESKTOP_STT_PROVIDER",
+        "DESKTOP_MOONSHINE_MODEL",
+        "DESKTOP_MOONSHINE_LANGUAGE",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -80,6 +84,7 @@ def test_settings_load_reads_env_file(tmp_path, monkeypatch):
     assert settings.goal_id == "goal-1"
     assert settings.auto_answer is True
     assert settings.simulate_audio is False
+    assert settings.stt_provider == "backend"
 
 
 def test_env_var_beats_env_file(tmp_path, monkeypatch):
@@ -106,3 +111,16 @@ def test_build_settings_overrides(monkeypatch):
     assert settings.session_id == "sess-9"
     assert settings.simulate_audio is True
     assert settings.auto_answer is False
+
+
+def test_settings_normalizes_stt_provider(monkeypatch):
+    monkeypatch.setenv("DESKTOP_STT_PROVIDER", "moonshine")
+    monkeypatch.setenv("DESKTOP_MOONSHINE_LANGUAGE", "en")
+    settings = Settings.load(env_file=__import__("pathlib").Path("missing.env"))
+    assert settings.stt_provider == "moonshine"
+    assert settings.moonshine_language == "en"
+
+
+def test_settings_rejects_unknown_stt_provider():
+    with pytest.raises(ValueError):
+        Settings(stt_provider="whisper")

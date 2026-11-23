@@ -138,6 +138,41 @@ class FakeApi:
         for event in self.answer_events:
             yield event
 
+    async def ingest_transcript_turn(
+        self,
+        session_id,
+        *,
+        speaker,
+        text,
+        segment_id=None,
+        confidence=None,
+        started_at=None,
+        ended_at=None,
+        idempotency_key=None,
+    ):
+        call = {
+            "session_id": session_id,
+            "speaker": speaker,
+            "text": text,
+            "segment_id": segment_id,
+            "confidence": confidence,
+            "idempotency_key": idempotency_key,
+        }
+        if not hasattr(self, "ingest_calls"):
+            self.ingest_calls = []
+            self._ingest_seq = 0
+        self.ingest_calls.append(call)
+        self._ingest_seq += 1
+        return {
+            "session_id": session_id,
+            "turn_id": f"ingest-{self._ingest_seq}",
+            "sequence_number": self._ingest_seq,
+            "speaker": speaker,
+            "segment_id": segment_id,
+            "duplicate": False,
+            "text": text,
+        }
+
     async def end_session(self, session_id, idempotency_key=None):
         self.ended += 1
         return {"id": session_id, "status": "ended"}
@@ -860,3 +895,62 @@ async def test_capture_artifact_without_session_does_nothing(qapp, monkeypatch):
     assert called == []
     assert api.artifact_calls == []
     assert "No session" in overlay.partial_label.text()
+
+
+@pytest.mark.asyncio
+async def test_moonshine_final_ingests_turn_and_triggers_auto_answer(qapp):
+    api = FakeApi()
+    controller, overlay = make_controller(
+        qapp,
+        api,
+        stt_provider="moonshine",
+        auto_answer=True,
+        auto_answer_delay_seconds=0.01,
+    )
+    controller.session_id = "s1"
+
+    controller._on_moonshine_final("mic", "seg-c", "I led the migration.", 0.98)
+    await asyncio.sleep(0.05)
+    controller._on_moonshine_final("loopback", "seg-q", "Why did you leave?", 0.99)
+    await asyncio.sleep(0.1)
+    if controller._answer_task is not None:
+        await controller._answer_task
+
+    assert len(api.ingest_calls) == 2
+    assert api.ingest_calls[0]["speaker"] == "candidate"
+    assert api.ingest_calls[1]["speaker"] == "interviewer"
+    assert "You: I led the migration." in overlay.transcript_edit.toPlainText()
+    assert "Interviewer: Why did you leave?" in overlay.transcript_edit.toPlainText()
+    assert api.answer_calls == [("ingest-2", "ingest-1", True)]
+
+
+@pytest.mark.asyncio
+async def test_ensure_stt_ready_fails_when_ingest_endpoint_missing(qapp, monkeypatch):
+    from desktop_client.api import ApiError
+    import desktop_client.moonshine_stt as moonshine_stt
+
+    monkeypatch.setattr(moonshine_stt, "_import_moonshine", lambda: object())
+
+    class MissingIngestApi(FakeApi):
+        async def ingest_transcript_turn(self, *args, **kwargs):
+            raise ApiError(404, "not_found", "Not Found")
+
+    controller, _ = make_controller(qapp, MissingIngestApi(), stt_provider="moonshine")
+    with pytest.raises(SessionError) as excinfo:
+        await controller._ensure_stt_ready()
+    assert "transcript/turns" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_ensure_stt_ready_allows_session_not_found_probe(qapp, monkeypatch):
+    from desktop_client.api import ApiError
+    import desktop_client.moonshine_stt as moonshine_stt
+
+    monkeypatch.setattr(moonshine_stt, "_import_moonshine", lambda: object())
+
+    class ProbeApi(FakeApi):
+        async def ingest_transcript_turn(self, *args, **kwargs):
+            raise ApiError(404, "http_error", "Session not found")
+
+    controller, _ = make_controller(qapp, ProbeApi(), stt_provider="moonshine")
+    await controller._ensure_stt_ready()

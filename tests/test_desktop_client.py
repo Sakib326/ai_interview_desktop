@@ -408,6 +408,25 @@ async def test_mic_frames_loopback_uses_wasapi(monkeypatch):
     assert extra is not None and getattr(extra, "loopback", False) is True
 
 
+def test_loopback_input_candidates_prefer_wasapi_then_try_all():
+    from desktop_client.audio import _loopback_input_devices
+
+    class _Devices:
+        @staticmethod
+        def query_devices():
+            return [
+                {"name": "Stereo Mix MME", "max_input_channels": 2, "hostapi": 0},
+                {"name": "Stereo Mix WASAPI", "max_input_channels": 2, "hostapi": 1},
+                {"name": "Microphone", "max_input_channels": 2, "hostapi": 1},
+            ]
+
+        @staticmethod
+        def query_hostapis():
+            return [{"name": "MME"}, {"name": "Windows WASAPI"}]
+
+    assert _loopback_input_devices(_Devices) == [1, 0]
+
+
 def test_audio_conversion_downmix_and_resample():
     # 1 kHz sine-ish pattern at 48 kHz stereo -> 16 kHz mono, 50 ms = 800 samples out.
     import math

@@ -19,6 +19,7 @@ try {
         "--name", "overlay",
         "--paths", ".",
         "--collect-data", "sounddevice",
+        "--collect-all", "soundcard",
         "--exclude-module", "pytest",
         "--exclude-module", "tests",
         "--distpath", "dist",

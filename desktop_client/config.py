@@ -30,6 +30,8 @@ _AUDIO_SOURCE_ALIASES = {
     "loopback,mic": "both",
 }
 
+STT_PROVIDERS = frozenset({"backend", "moonshine"})
+
 _TRUTHY = {"1", "true", "yes", "on"}
 
 
@@ -111,6 +113,20 @@ def audio_source_channels(source: Optional[str]) -> list:
     )
 
 
+def normalize_stt_provider(provider: Optional[str]) -> str:
+    """Normalize the STT provider setting.
+
+    ``backend`` preserves the existing WS audio -> backend STT path. ``moonshine``
+    transcribes locally and posts finalized turns via transcript ingest.
+    """
+    p = (provider or "backend").strip().lower()
+    if p in STT_PROVIDERS:
+        return p
+    raise ValueError(
+        f"Unknown STT provider {provider!r}; expected one of backend, moonshine"
+    )
+
+
 @dataclass
 class Settings:
     api_base_url: str = "http://127.0.0.1:8000"
@@ -125,6 +141,9 @@ class Settings:
     auto_answer: bool = False
     auto_answer_delay_seconds: float = 1.5
     audio_source: str = "mic"
+    stt_provider: str = "backend"
+    moonshine_model: str = ""
+    moonshine_language: str = "en"
     request_timeout_seconds: float = 30.0
 
     def __post_init__(self) -> None:
@@ -133,6 +152,9 @@ class Settings:
         self.api_base_url = self.api_base_url.rstrip("/")
         self.ws_base_url = self.ws_base_url.rstrip("/")
         self.audio_source = normalize_audio_source(self.audio_source)
+        self.stt_provider = normalize_stt_provider(self.stt_provider)
+        self.moonshine_model = (self.moonshine_model or "").strip()
+        self.moonshine_language = (self.moonshine_language or "en").strip() or "en"
 
     @property
     def api_v1(self) -> str:
@@ -179,5 +201,8 @@ class Settings:
                 get("DESKTOP_AUTO_ANSWER_DELAY_SECONDS", "1.5")
             ),
             audio_source=normalize_audio_source(get("DESKTOP_AUDIO_SOURCE", "mic") or "mic"),
+            stt_provider=normalize_stt_provider(get("DESKTOP_STT_PROVIDER", "backend") or "backend"),
+            moonshine_model=get("DESKTOP_MOONSHINE_MODEL", ""),
+            moonshine_language=get("DESKTOP_MOONSHINE_LANGUAGE", "en") or "en",
             request_timeout_seconds=float(get("DESKTOP_REQUEST_TIMEOUT", "30")),
         )
