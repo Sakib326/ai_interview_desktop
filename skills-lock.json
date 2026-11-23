@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "moonshine-voice": {
+      "source": "moonshine-ai/moonshine",
+      "sourceType": "github",
+      "skillPath": ".agents/skills/moonshine-voice/SKILL.md",
+      "computedHash": "b1d12486bbf0b482db5a3fadd473b5e4e30f269621d23efbe1fc62a99f335f93"
+    }
+  }
+}
