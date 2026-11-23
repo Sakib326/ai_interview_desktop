@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
+import time
 import uuid
 from typing import Any, Dict, Optional
 
@@ -562,15 +562,6 @@ class LiveSessionController:
             allow_simulation_fallback=self.settings.simulate_audio,
             stop_event=self._stop_event,
         )
-        fed_frames = 0
-        fed_bytes = 0
-        last_log = asyncio.get_running_loop().time()
-        rms_last = 0.0
-        rms_max = 0.0
-        debug_dump_path = os.getenv("DESKTOP_DEBUG_AUDIO_DUMP", "").strip()
-        debug_dump_file = None
-        debug_dump_bytes = 0
-        debug_dump_limit = int(os.getenv("DESKTOP_DEBUG_AUDIO_DUMP_SECONDS", "15")) * SAMPLE_RATE * 2
         try:
             self._on_audio_state("streaming", source)
             await transcriber.start()
@@ -578,49 +569,6 @@ class LiveSessionController:
                 if not frame:
                     continue
                 await transcriber.feed(frame)
-                fed_frames += 1
-                fed_bytes += len(frame)
-                # Quick RMS for diagnosing silence/wrong device.
-                try:
-                    from array import array as _array
-
-                    samples = _array("h")
-                    samples.frombytes(bytes(frame))
-                    if samples:
-                        mean_sq = sum(s * s for s in samples) / len(samples)
-                        rms_last = mean_sq ** 0.5
-                        if rms_last > rms_max:
-                            rms_max = rms_last
-                except Exception:
-                    pass
-                if debug_dump_path and debug_dump_bytes < debug_dump_limit:
-                    try:
-                        import wave as _wave
-
-                        if debug_dump_file is None:
-                            os.makedirs(os.path.dirname(debug_dump_path) or ".", exist_ok=True)
-                            debug_dump_file = _wave.open(debug_dump_path, "wb")
-                            debug_dump_file.setnchannels(1)
-                            debug_dump_file.setsampwidth(2)
-                            debug_dump_file.setframerate(SAMPLE_RATE)
-                            logger.info("[moonshine:%s] dumping debug audio to %s", source, debug_dump_path)
-                        debug_dump_file.writeframes(bytes(frame))
-                        debug_dump_bytes += len(frame)
-                        if debug_dump_bytes >= debug_dump_limit:
-                            debug_dump_file.close()
-                            debug_dump_file = None
-                            logger.info("[moonshine:%s] debug audio dump complete: %s", source, debug_dump_path)
-                    except Exception:
-                        logger.exception("[moonshine:%s] debug audio dump failed", source)
-                        debug_dump_path = ""
-                now = asyncio.get_running_loop().time()
-                if now - last_log >= 5.0:
-                    logger.info(
-                        "[moonshine:%s] fed frames=%d bytes=%d (%.1fs audio) rms_last=%.1f rms_max=%.1f state=%s",
-                        source, fed_frames, fed_bytes, fed_frames * 0.05,
-                        rms_last, rms_max, transcriber.debug_state(),
-                    )
-                    last_log = now
             self._on_audio_state("finalizing", source)
             await transcriber.stop()
             if self._stop_event.is_set():
@@ -639,24 +587,16 @@ class LiveSessionController:
             logger.exception("Moonshine channel %s failed", source)
             return AudioOutcome("failed", message=str(exc))
         finally:
-            try:
-                if debug_dump_file is not None:
-                    debug_dump_file.close()
-            except Exception:
-                pass
             await frames.aclose()
-            logger.info(
-                "[moonshine:%s] channel finished fed_frames=%d fed_bytes=%d rms_max=%.1f",
-                source, fed_frames, fed_bytes, rms_max,
-            )
 
     def _on_moonshine_partial(self, source: str, segment_id: str, text: str) -> None:
         if self._stopping or self._stop_event.is_set():
             return
         logger.info("[moonshine:%s] partial seg=%s text=%r", source, segment_id, text[:80])
-        self._moonshine_partials[f"{source}:{segment_id}"] = text
-        # Keep the overlay partial simple: show the most recent partial.
-        self.overlay.set_partial(text)
+        key = f"{source}:{segment_id}"
+        self._moonshine_partials.pop(key, None)
+        self._moonshine_partials[key] = text
+        self._render_transcript()
 
     def _on_moonshine_error(self, source: str, exc: Exception) -> None:
         logger.warning("[moonshine:%s] error: %s", source, exc)
@@ -671,7 +611,6 @@ class LiveSessionController:
             "[moonshine:%s] final seg=%s conf=%s text=%r",
             source, segment_id, confidence, text[:120],
         )
-        self._moonshine_partials.pop(f"{source}:{segment_id}", None)
         speaker = SPEAKER_INTERVIEWER if source == "loopback" else SPEAKER_CANDIDATE
         task = asyncio.create_task(
             self._ingest_moonshine_final(source, speaker, segment_id, text, confidence),
@@ -690,6 +629,7 @@ class LiveSessionController:
     ) -> None:
         if not self.session_id:
             return
+        ingest_started = time.perf_counter()
         try:
             result = await self.api.ingest_transcript_turn(
                 self.session_id,
@@ -698,6 +638,12 @@ class LiveSessionController:
                 segment_id=segment_id,
                 confidence=confidence,
                 idempotency_key=f"moonshine-{self.session_id}-{segment_id}",
+            )
+            logger.info(
+                "Moonshine transcript ingest completed in %.0f ms (source=%s segment=%s)",
+                (time.perf_counter() - ingest_started) * 1000,
+                source,
+                segment_id,
             )
         except ApiError as exc:
             logger.warning("Moonshine transcript ingest failed: %s", exc)
@@ -710,7 +656,9 @@ class LiveSessionController:
             self.overlay.set_partial(f"Local STT ingest failed: {exc}")
             return
 
+        self._moonshine_partials.pop(f"{source}:{segment_id}", None)
         if result.get("duplicate"):
+            self._render_transcript()
             return
 
         payload = {
@@ -888,10 +836,14 @@ class LiveSessionController:
             self._render_transcript()
 
     def _render_transcript(self) -> None:
-        self.overlay.set_turns(self.transcript.rendered_turns())
+        live_turn = None
+        if self._moonshine_partials:
+            key, text = next(reversed(self._moonshine_partials.items()))
+            source = key.split(":", 1)[0]
+            label = "Interviewer" if source == "loopback" else "You"
+            live_turn = (label, text + " …")
+        self.overlay.set_turns(self.transcript.rendered_turns(), live_turn=live_turn)
         partial = self.transcript.partial_text
-        if not partial and self._moonshine_partials:
-            partial = next(reversed(self._moonshine_partials.values()))
         self.overlay.set_partial(partial)
 
     # ----------------------------------------------------------------- answers
@@ -906,20 +858,25 @@ class LiveSessionController:
         """Delay auto-answer so a brief mid-speech pause doesn't trigger it."""
         self._cancel_pending_auto_answer()
 
+        delay = getattr(
+            self.settings, "auto_answer_delay_seconds", AUTO_ANSWER_DELAY_SECONDS
+        )
+        scheduled_at = time.perf_counter()
+
         def _fire() -> None:
             self._pending_auto_answer = None
+            logger.info(
+                "Auto-answer delay elapsed in %.0f ms (configured=%.0f ms)",
+                (time.perf_counter() - scheduled_at) * 1000,
+                delay * 1000,
+            )
             if self._stopping or self._stop_event.is_set():
                 return
             if question_turn_id in self._answered_turns:
                 return
             self._start_answer(question_turn_id, candidate_turn_id, gated=True)
 
-        delay = getattr(
-            self.settings, "auto_answer_delay_seconds", AUTO_ANSWER_DELAY_SECONDS
-        )
-        self._pending_auto_answer = asyncio.get_running_loop().call_later(
-            delay, _fire
-        )
+        self._pending_auto_answer = asyncio.get_running_loop().call_later(delay, _fire)
 
     def answer_latest(self) -> None:
         """Manual (F10) answer: prefer the interviewer's latest question."""
@@ -958,6 +915,8 @@ class LiveSessionController:
     ) -> None:
         self.overlay.set_answer_loading()
         accumulated = []
+        answer_started = time.perf_counter()
+        first_event = True
         try:
             async for event_type, envelope in self.api.answer(
                 self.session_id or "",
@@ -965,6 +924,14 @@ class LiveSessionController:
                 candidate_turn_id,
                 gated=gated,
             ):
+                if first_event:
+                    logger.info(
+                        "Answer endpoint produced first event in %.0f ms (gated=%s event=%s)",
+                        (time.perf_counter() - answer_started) * 1000,
+                        gated,
+                        event_type,
+                    )
+                    first_event = False
                 payload = envelope.get("payload", envelope)
                 if event_type == "assistant.answer_token":
                     delta = str(payload.get("answer_text_delta") or "")

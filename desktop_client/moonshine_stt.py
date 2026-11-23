@@ -268,7 +268,6 @@ class MoonshineTranscriberSession:
         if callable(start):
             await asyncio.to_thread(start)
         self._transcriber = transcriber
-        self._install_debug_hooks(transcriber)
         logger.info(
             "Moonshine transcriber started for source=%s model=%s arch=%s",
             self.source,
@@ -276,105 +275,15 @@ class MoonshineTranscriberSession:
             model_arch,
         )
 
-    def _install_debug_hooks(self, transcriber: Any) -> None:
-        """Temporary debug: log what the stream sees/produces."""
-        try:
-            stream = transcriber.get_default_stream()
-        except Exception:
-            logger.exception("[moonshine:%s] debug: could not get default stream", self.source)
-            return
-
-        orig_notify = getattr(stream, "_notify_from_transcript", None)
-        if callable(orig_notify):
-            source = self.source
-
-            def _wrapped_notify(transcript):
-                try:
-                    lines = getattr(transcript, "lines", []) or []
-                    logger.info(
-                        "[moonshine:%s] transcript lines=%d",
-                        source, len(lines),
-                    )
-                    for i, line in enumerate(lines[:5]):
-                        logger.info(
-                            "[moonshine:%s] line[%d] text=%r is_new=%s is_updated=%s has_text_changed=%s is_complete=%s",
-                            source, i,
-                            str(getattr(line, "text", "") or "")[:80],
-                            getattr(line, "is_new", None),
-                            getattr(line, "is_updated", None),
-                            getattr(line, "has_text_changed", None),
-                            getattr(line, "is_complete", None),
-                        )
-                except Exception:
-                    logger.exception("[moonshine:%s] debug notify inspect failed", source)
-                return orig_notify(transcript)
-
-            stream._notify_from_transcript = _wrapped_notify
-
-        orig_update = getattr(stream, "update_transcription", None)
-        if callable(orig_update):
-            source = self.source
-
-            def _wrapped_update(flags=0):
-                t = orig_update(flags)
-                try:
-                    lines = getattr(t, "lines", []) or []
-                    if lines or getattr(stream, "_last_pass", 0) > 0.01:
-                        logger.info(
-                            "[moonshine:%s] update_transcription flags=%s lines=%d last_pass=%s",
-                            source, flags, len(lines), getattr(stream, "_last_pass", None),
-                        )
-                except Exception:
-                    pass
-                return t
-
-            stream.update_transcription = _wrapped_update
-            logger.info("[moonshine:%s] debug hooks installed", self.source)
-
     async def feed(self, pcm_s16le: bytes) -> None:
         if self._closed or self._transcriber is None or not pcm_s16le:
             return
         audio = _pcm_s16le_bytes_to_float32(pcm_s16le)
-        if not hasattr(self, "_feed_debug_count"):
-            self._feed_debug_count = 0
-        self._feed_debug_count += 1
-        if self._feed_debug_count <= 3 or self._feed_debug_count % 200 == 0:
-            try:
-                import numpy as np
-                arr = np.asarray(audio)
-                logger.info(
-                    "[moonshine:%s] feed#%d len=%d dtype=%s min=%.4f max=%.4f mean=%.6f",
-                    self.source, self._feed_debug_count, len(arr), arr.dtype,
-                    float(arr.min()) if arr.size else 0, float(arr.max()) if arr.size else 0,
-                    float(arr.mean()) if arr.size else 0,
-                )
-            except Exception:
-                logger.info("[moonshine:%s] feed#%d len=%s type=%s", self.source, self._feed_debug_count, len(audio) if hasattr(audio,'__len__') else '?', type(audio))
         add_audio = getattr(self._transcriber, "add_audio", None)
         if not callable(add_audio):  # pragma: no cover - defensive
             raise MoonshineUnavailableError("moonshine_voice.Transcriber.add_audio not found")
         # add_audio is CPU-bound-ish but fast; keep it off the event loop.
         await asyncio.to_thread(add_audio, audio, self.sample_rate)
-
-    def debug_state(self) -> dict[str, Any]:
-        """Best-effort internal state for diagnosing no-transcript issues."""
-        t = self._transcriber
-        if t is None:
-            return {"transcriber": None}
-        stream = getattr(t, "_default_stream", None)
-        state: dict[str, Any] = {
-            "has_stream": stream is not None,
-            "event_count": getattr(self._listener, "event_count", None),
-        }
-        if stream is not None:
-            for attr in (
-                "_stream_time", "_last_update_time", "_last_pass",
-                "_update_interval", "_transcribe_flags",
-            ):
-                state[attr] = getattr(stream, attr, None)
-            listeners = getattr(stream, "_listeners", None)
-            state["listeners"] = len(listeners) if listeners is not None else None
-        return state
 
     async def stop(self) -> None:
         if self._transcriber is None:

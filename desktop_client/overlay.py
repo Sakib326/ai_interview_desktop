@@ -4,7 +4,7 @@ Implements PySide6 QWidget overlay with:
 - Window flags: FramelessWindowHint | WindowStaysOnTopHint | Tool | WindowDoesNotAcceptFocus
 - Translucent rounded rect paintEvent with dynamic alpha for black-box fallback
 - Pulsing red recording dot, status row, model badge, and stealth badge
-- Read-only QTextEdit for final transcript turns and separate QLabel for partials
+- Read-only QTextEdit for finalized turns and the current live partial
 - Window-level click-through (WindowTransparentForInput)
 - Windows display affinity re-application rules across HWND re-creations
 """
@@ -205,8 +205,7 @@ class OverlayWindow(QWidget):
         self.answer_edit.hide()
         main_layout.addWidget(self.answer_edit, stretch=1)
 
-        # Live caption: shows streaming STT partials immediately so text appears
-        # before end-of-turn finalization.
+        # Compact status note for capture and transcription notices.
         self.partial_label = QLabel(self)
         self.partial_label.setWordWrap(True)
         self.partial_label.setStyleSheet(
@@ -407,9 +406,11 @@ class OverlayWindow(QWidget):
         self.model_label.setText(text)
 
     # ---------------- Transcript / answer rendering ----------------
-    def set_turns(self, turns):
-        """Render [(label, text), ...] as the finalized transcript."""
+    def set_turns(self, turns, live_turn=None):
+        """Render finalized turns and an optional live ``(label, text)`` row."""
         lines = [f"{label}: {text}" for label, text in turns]
+        if live_turn is not None and live_turn[1]:
+            lines.append(f"{live_turn[0]}: {live_turn[1]}")
         self.transcript_edit.setPlainText("\n".join(lines))
         scrollbar = self.transcript_edit.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
