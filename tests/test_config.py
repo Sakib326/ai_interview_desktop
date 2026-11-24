@@ -124,3 +124,44 @@ def test_settings_normalizes_stt_provider(monkeypatch):
 def test_settings_rejects_unknown_stt_provider():
     with pytest.raises(ValueError):
         Settings(stt_provider="whisper")
+
+
+def test_portal_url_defaults_and_override():
+    settings = Settings(api_base_url="http://host:9000", access_token="t")
+    assert settings.portal_url == "http://host:9000/web/desktop-login"
+
+    settings = Settings(
+        api_base_url="http://host:9000",
+        auth_portal_url="https://portal.example/desk/",
+        access_token="t",
+    )
+    assert settings.portal_url == "https://portal.example/desk"
+
+
+def test_login_settings_from_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("DESKTOP_LOGIN_ENABLED", "0")
+    monkeypatch.setenv("DESKTOP_AUTH_PORTAL_URL", "http://portal.test/desk")
+    monkeypatch.setenv(
+        "DESKTOP_OIDC_REDIRECT_URI", "http://127.0.0.1:8765/callback"
+    )
+    monkeypatch.setenv("DESKTOP_DEVICE_NAME", "machine-1")
+
+    settings = Settings.load(tmp_path / "missing.env")
+    assert settings.login_enabled is False
+    assert settings.portal_url == "http://portal.test/desk"
+    assert settings.oidc_redirect_uri == "http://127.0.0.1:8765/callback"
+    assert settings.device_name == "machine-1"
+
+
+def test_build_settings_no_login_disables_browser(monkeypatch):
+    monkeypatch.setenv("DESKTOP_ACCESS_TOKEN", "token")
+
+    class Args:
+        api_url = None
+        session = None
+        simulate_audio = False
+        auto_answer = False
+        no_answer = False
+        no_login = True
+
+    assert build_settings(Args).login_enabled is False

@@ -19,8 +19,16 @@ import sys
 from PySide6.QtWidgets import QApplication, QMessageBox
 from qasync import QEventLoop
 
+from desktop_client.api import ApiClient
 from desktop_client.audio import mic_frames
-from desktop_client.config import Settings, audio_source_channels
+from desktop_client.auth import AuthError, login
+from desktop_client.config import Settings, audio_source_channels, token_expiring
+from desktop_client.credentials import (
+    CredentialStoreUnavailable,
+    KeyringTokenStore,
+    MemoryTokenStore,
+    StoredCredentials,
+)
 from desktop_client.hotkeys import VK_F8, VK_F9, GlobalHotkeys, TrayIcon
 from desktop_client.overlay import OverlayWindow
 from desktop_client.session import LiveSessionController
@@ -138,10 +146,107 @@ async def stream_audio_to_overlay(
         overlay.set_partial(f"Audio capture error: {exc}")
 
 
+def _persist_credentials(
+    settings: Settings, store, email: str = "", display_name: str = ""
+) -> None:
+    if not settings.refresh_token or not settings.device_id:
+        return
+    try:
+        store.save(
+            StoredCredentials(
+                refresh_token=settings.refresh_token,
+                device_id=settings.device_id,
+                email=email,
+                display_name=display_name,
+            )
+        )
+    except CredentialStoreUnavailable as exc:
+        logger.warning("Could not store credentials securely: %s", exc)
+
+
+async def ensure_authenticated(settings: Settings, store) -> str:
+    """Make a live token available and return an error string on failure.
+
+    Order: a still-valid environment token -> stored/environment refresh token
+    -> browser login. An expired environment token must not pin the client to
+    live mode; trusting it blindly produced a 401 loop instead of a login.
+    """
+    if settings.simulate_audio:
+        # Headless/device-less verification must never block on a browser.
+        return ""
+    if settings.access_token and not token_expiring(settings.access_token, 0):
+        return ""
+    if settings.access_token:
+        logger.info(
+            "Configured access token is expired; falling back to refresh/login"
+        )
+        settings.access_token = ""
+
+    stored = None
+    try:
+        stored = store.load()
+    except CredentialStoreUnavailable as exc:
+        logger.warning("Secure credential store unavailable: %s", exc)
+
+    refresh_token = stored.refresh_token if stored else settings.refresh_token
+    device_id = stored.device_id if stored else settings.device_id
+    if refresh_token and device_id:
+        settings.refresh_token = refresh_token
+        settings.device_id = device_id
+        api = ApiClient(
+            settings,
+            on_tokens_rotated=lambda: _persist_credentials(settings, store),
+        )
+        try:
+            if await api.refresh_token():
+                logger.info(
+                    "Reused stored credentials for %s",
+                    (stored.email if stored else "") or "operator",
+                )
+                return ""
+        finally:
+            await api.aclose()
+        settings.refresh_token = ""
+        settings.device_id = ""
+        store.clear()
+
+    if not settings.login_enabled:
+        return (
+            "DESKTOP_ACCESS_TOKEN is expired or not set and browser login is "
+            "disabled"
+        )
+
+    try:
+        result = await login(settings)
+    except AuthError as exc:
+        logger.warning("Browser login failed: %s", exc)
+        return str(exc)
+
+    settings.access_token = result.access_token
+    settings.refresh_token = result.refresh_token
+    settings.device_id = result.device_id
+    _persist_credentials(settings, store, result.email, result.display_name)
+    return ""
+
+
+def _build_store():
+    """Prefer the OS credential store; degrade to memory with a warning."""
+    store = KeyringTokenStore()
+    try:
+        store.load()
+        return store
+    except CredentialStoreUnavailable as exc:
+        logger.warning(
+            "No OS credential store (%s); credentials will not persist", exc
+        )
+        return MemoryTokenStore()
+
+
 async def async_main(app: QApplication, settings: Settings, *, use_tray: bool = True,
-                     use_hotkeys: bool = True):
+                     use_hotkeys: bool = True, store=None):
     overlay = OverlayWindow()
     overlay.show()
+    store = store or MemoryTokenStore()
 
     loop = asyncio.get_running_loop()
     close_future: asyncio.Future = loop.create_future()
@@ -156,8 +261,19 @@ async def async_main(app: QApplication, settings: Settings, *, use_tray: bool = 
     audio_task = None
     local_stop = asyncio.Event()
 
+    auth_error = ""
+    if not settings.configured:
+        if settings.login_enabled:
+            overlay.set_status("signing in")
+            overlay.set_partial("Opening browser login\u2026")
+        auth_error = await ensure_authenticated(settings, store)
+
     if settings.configured:
-        controller = LiveSessionController(overlay, settings)
+        api = ApiClient(
+            settings,
+            on_tokens_rotated=lambda: _persist_credentials(settings, store),
+        )
+        controller = LiveSessionController(overlay, settings, api=api)
         overlay.stop_requested.connect(
             lambda: asyncio.create_task(controller.stop())
         )
@@ -170,7 +286,7 @@ async def async_main(app: QApplication, settings: Settings, *, use_tray: bool = 
     else:
         overlay.set_status("no backend")
         overlay.set_partial(
-            "DESKTOP_ACCESS_TOKEN is not set \u2014 capture-only mode"
+            auth_error or "DESKTOP_ACCESS_TOKEN is not set \u2014 capture-only mode"
         )
         overlay.stop_requested.connect(local_stop.set)
         audio_task = asyncio.create_task(
@@ -246,6 +362,10 @@ def build_settings(args) -> Settings:
         settings.auto_answer = True
     if args.no_answer:
         settings.auto_answer = False
+    if getattr(args, "no_login", False):
+        settings.login_enabled = False
+    if settings.simulate_audio and not settings.access_token:
+        settings.login_enabled = False
     # Recompute the ws origin when the API URL was overridden.
     if args.api_url or not settings.ws_base_url:
         settings.__post_init__()
@@ -275,6 +395,11 @@ def main(argv=None):
         action="store_true",
         help="Never auto-answer (F10 still answers manually)",
     )
+    parser.add_argument(
+        "--no-login",
+        action="store_true",
+        help="Never open the browser login flow (capture-only without a token)",
+    )
     parser.add_argument("--no-tray", action="store_true", help="Disable the tray icon")
     parser.add_argument(
         "--no-hotkeys", action="store_true", help="Disable Windows global hotkeys"
@@ -296,12 +421,14 @@ def main(argv=None):
     sig_timer.start(250)
     sig_timer.timeout.connect(lambda: None)
 
+    store = _build_store()
     task = loop.create_task(
         async_main(
             app,
             settings,
             use_tray=not args.no_tray,
             use_hotkeys=not args.no_hotkeys,
+            store=store,
         )
     )
 

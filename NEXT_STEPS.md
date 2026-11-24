@@ -71,23 +71,48 @@ Re-run with `DESKTOP_LIVE_API` / `DESKTOP_LIVE_TOKEN` (and optionally
 
 ### Still client-side
 
-- [ ] Interactive OIDC login (loopback PKCE) so a token pair comes from the
-      IdP instead of `DESKTOP_ACCESS_TOKEN` being pasted in.
+- [x] Interactive login: environment token -> stored refresh token -> browser
+      portal handoff. Spec: `docs/desktop-auth-handoff.md`; change record:
+      `docs/desktop-auth-changes.md`. The desktop never talks to the IdP token
+      endpoint and never reads the portal's session cookie.
 - [ ] Drive the debrief UI from `debrief.status_changed` instead of polling.
 - [ ] Loopback/system-audio capture (the source tag exists; the capture path
       does not).
 
 ---
 
-## Remaining — backend (separate repo, not changed here)
+## Backend (separate repo; interactive login implemented in this pass)
 
 The three blocking items are **resolved**: `/audio?source=`, speaker on
 transcript events, and Turn Gate behind `POST /sessions/{id}/live/answer`.
-One item remains:
+One item remains open:
 
 1. **Audio format exposure.** Publish the frozen format on
    `session.status_changed` or add `GET /sessions/{id}/audio-config`. Today the
    client assumes PCM S16LE mono 16 kHz 50 ms.
+2. **Desktop interactive login — implemented.** Backend record:
+   `E:\ai_interview\docs\desktop-auth-handoff-changes.md`. Added
+   `GET /web/desktop-login`, `POST /api/v1/auth/handoff`, the one-time code
+   store, `AuthService.issue_for_user`, and the loopback redirect rule in
+   `settings.is_registered_redirect_uri()`. Verified with
+   `backend/tests/evaluation/auth/test_handoff.py` (25 passed, 2 skipped with
+   the existing auth suites).
+
+### Desktop interactive login — still open
+
+- [ ] **IdP redirect allowlist (deployment, not code).** The backend now accepts
+      ephemeral loopback ports, but the identity provider must also allow the
+      desktop redirect (exact URI or a loopback rule for native clients).
+      Without it the browser reaches the IdP and is rejected.
+- [ ] **Web session durability.** `/web/auth/callback` still discards the
+      rotating refresh token and `device_id` (`backend/web/auth/routes.py`), so
+      the web session itself cannot refresh.
+- [ ] **`/authorize` deviations.** JSON response instead of `302`, in-memory
+      state store, and a required `nonce`; unchanged, the desktop follows the
+      JSON contract.
+- [ ] **Device flow.** RFC 8628 remains an alternative; not implemented.
+- [ ] **Backend restart during handoff.** Process-local `_HANDOFF_CODES`;
+      Redis is required only if `WORKER_COUNT` is ever raised.
 
 ### Open questions (for the backend owner)
 

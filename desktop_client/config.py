@@ -145,6 +145,12 @@ class Settings:
     moonshine_model: str = ""
     moonshine_language: str = "en"
     request_timeout_seconds: float = 30.0
+    auth_portal_url: str = ""
+    oidc_redirect_uri: str = ""
+    oauth_scope: str = "openid profile email"
+    login_enabled: bool = True
+    login_timeout_seconds: float = 120.0
+    device_name: str = ""
 
     def __post_init__(self) -> None:
         if not self.ws_base_url:
@@ -155,6 +161,13 @@ class Settings:
         self.stt_provider = normalize_stt_provider(self.stt_provider)
         self.moonshine_model = (self.moonshine_model or "").strip()
         self.moonshine_language = (self.moonshine_language or "en").strip() or "en"
+        self.auth_portal_url = (self.auth_portal_url or "").strip()
+        self.oidc_redirect_uri = (self.oidc_redirect_uri or "").strip()
+        self.oauth_scope = (self.oauth_scope or "openid profile email").strip()
+        if not self.device_name:
+            import platform as _platform
+
+            self.device_name = _platform.node() or "desktop"
 
     @property
     def api_v1(self) -> str:
@@ -172,6 +185,14 @@ class Settings:
     def configured(self) -> bool:
         """True when the client has enough to talk to a backend."""
         return bool(self.access_token)
+
+    @property
+    def portal_url(self) -> str:
+        """Browser login entry point (the backend web panel by default)."""
+        explicit = (self.auth_portal_url or "").strip()
+        if explicit:
+            return explicit.rstrip("/")
+        return f"{self.api_base_url}/web/desktop-login"
 
     @classmethod
     def load(cls, env_file: Optional[Path] = None) -> "Settings":
@@ -205,4 +226,10 @@ class Settings:
             moonshine_model=get("DESKTOP_MOONSHINE_MODEL", ""),
             moonshine_language=get("DESKTOP_MOONSHINE_LANGUAGE", "en") or "en",
             request_timeout_seconds=float(get("DESKTOP_REQUEST_TIMEOUT", "30")),
+            auth_portal_url=get("DESKTOP_AUTH_PORTAL_URL"),
+            oidc_redirect_uri=get("DESKTOP_OIDC_REDIRECT_URI"),
+            oauth_scope=get("DESKTOP_OAUTH_SCOPE", "openid profile email"),
+            login_enabled=_as_bool(get("DESKTOP_LOGIN_ENABLED"), True),
+            login_timeout_seconds=float(get("DESKTOP_LOGIN_TIMEOUT", "120")),
+            device_name=get("DESKTOP_DEVICE_NAME"),
         )

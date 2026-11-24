@@ -397,6 +397,16 @@ async def test_mic_frames_loopback_uses_wasapi(monkeypatch):
             return _LoopbackStream(**kwargs)
 
     monkeypatch.setitem(sys.modules, "sounddevice", _LoopbackSoundDevice)
+
+    # Force the PortAudio path: on machines with a default playback endpoint the
+    # SoundCard WASAPI path would succeed first and skip this test's fake device.
+    def _no_soundcard(callback):
+        raise RuntimeError("soundcard disabled for this test")
+
+    monkeypatch.setattr(
+        "desktop_client.audio._open_default_wasapi_loopback", _no_soundcard
+    )
+
     stop = asyncio.Event()
     agen = mic_frames(source="loopback", allow_simulation_fallback=False, stop_event=stop)
     frame = await anext(agen)

@@ -67,14 +67,18 @@ directory. No installer or code signing yet.
 
 ## Run
 
-Copy `.env.example` to `.env` and set `DESKTOP_ACCESS_TOKEN` for live mode.
+Copy `.env.example` to `.env`. No token is required for interactive use: when
+the client is unauthenticated it opens the backend portal in the system browser,
+completes the login there, and receives its own token pair on a loopback
+listener. The portal's session cookie is never read.
 
 ```bash
 python -m desktop_client.main
 ```
 
-Without a token the client runs in **capture-only mode**: it proves the
-overlay and the 50 ms framing without any network calls.
+Set `DESKTOP_ACCESS_TOKEN` to skip the browser flow (dev/CI), or pass
+`--no-login` to force **capture-only mode**: the overlay and the 50 ms framing
+without any network calls.
 
 Headless/device-less verification uses synthetic frames:
 
@@ -92,6 +96,7 @@ python -m desktop_client.main --simulate-audio
 | `--api-url <url>` | Override the backend origin (ws origin is derived) |
 | `--auto-answer` | Answer interviewer finals through the gated live endpoint |
 | `--no-answer` | Never auto-answer (F10 still works) |
+| `--no-login` | Never open the browser login (capture-only without a token) |
 | `--no-tray` | Disable the tray icon |
 | `--no-hotkeys` | Disable Windows global hotkeys |
 
@@ -111,10 +116,16 @@ receiving mouse input. It also carries **Forget all memory…** (confirmed) and
 
 ### Tokens
 
-Set `DESKTOP_REFRESH_TOKEN` and `DESKTOP_DEVICE_ID` alongside the access token
-to survive the 60-minute access-token lifetime: the client refreshes ahead of
-expiry, on HTTP 401, and once on a `4401` WebSocket rejection. Without them a
-long session ends at the first expiry.
+Browser login stores the rotating refresh token and `device_id` in Windows
+Credential Manager (via `keyring`); the access token stays in memory. The client
+refreshes ahead of expiry, on HTTP 401, and once on a `4401` WebSocket rejection,
+and persists each rotated refresh token. Without a stored credential a long
+session ends at the first expiry.
+
+Manual mode still works: set `DESKTOP_REFRESH_TOKEN` and `DESKTOP_DEVICE_ID`
+alongside `DESKTOP_ACCESS_TOKEN`. Interactive login, the redirect registration,
+and the remaining IdP/backend items are specified in
+[`docs/desktop-auth-handoff.md`](./docs/desktop-auth-handoff.md).
 
 ---
 
@@ -145,7 +156,9 @@ backend gives it no sequencing effect.
 ```text
 desktop_client/
   __init__.py     # version
-  config.py       # env/.env settings, ws origin derivation
+  config.py       # env/.env settings, ws origin derivation, portal URL
+  auth.py         # browser login: PKCE, loopback receiver, handoff exchange
+  credentials.py  # OS credential store (refresh token + device_id)
   api.py          # REST + SSE client (httpx), structured ApiError
   events.py       # /events WebSocket: heartbeat, reconnect, resubscribe
   audio.py        # sounddevice capture -> 1,600-byte frames
@@ -159,7 +172,9 @@ desktop_client/
 tests/
   conftest.py             # offscreen QApplication + local WS server
   test_desktop_client.py  # overlay, audio framing, stealth (19)
-  test_config.py          # settings/derivation
+  test_config.py          # settings/derivation, portal URL, login flags
+  test_auth.py            # PKCE, loopback receiver, handoff exchange
+  test_credentials.py     # OS credential store + in-memory double
   test_transcript.py      # dedup, ordering, speaker merge
   test_api.py             # REST/SSE parsing and error mapping
   test_events.py          # live socket: heartbeat, reconnect, replay gap
@@ -173,7 +188,7 @@ tests/
 
 ```bash
 QT_QPA_PLATFORM=offscreen pytest -q
-# 75 passed, 1 skipped
+# 115 passed, 1 skipped
 ```
 
 The socket tests start real local WebSocket servers; the HTTP tests use
@@ -209,8 +224,9 @@ asserts the lifecycle and error surfacing rather than transcript text.
   `DESKTOP_AUDIO_SOURCE=mic` there are no interviewer turns, so use F10 or run
   in `loopback`/`both` mode with interviewer audio playing through system output.
 - `/audio` does not negotiate audio format; 16 kHz S16LE mono is an assumption.
-- No interactive OIDC login yet: the access token (and optional refresh
-  credentials) must be supplied via the environment.
+- Interactive login is implemented (backend portal handoff + loopback PKCE).
+  It still requires the IdP to allow the desktop loopback redirect; see
+  [`docs/desktop-auth-handoff.md`](./docs/desktop-auth-handoff.md).
 - Stealth is Windows-only and best-effort; macOS/Linux report `UNSUPPORTED`.
   The §10.6 capture matrix must be run on the target machine before ship.
 - No packaging/installer yet; see `NEXT_STEPS.md`.

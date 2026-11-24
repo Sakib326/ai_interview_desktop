@@ -16,7 +16,10 @@ The client speaks the backend's actual wire contract: session setup, `/events`, 
 2. Transcript events carry `speaker`, so the client no longer refetches the transcript after each final.
 3. `POST /sessions/{id}/live/answer` runs the Turn Gate and emits `assistant.answer_skipped` when it declines; the manual `practice/answer` stays ungated.
 
-Remaining gaps are smaller: no audio-format negotiation, no interactive OIDC login in the client, and the debrief UI still polls instead of using `debrief.status_changed`.
+Remaining gaps are smaller: no audio-format negotiation, the IdP must still
+allow the desktop loopback redirect, and the debrief UI still polls instead of
+using `debrief.status_changed`. Interactive login itself is implemented
+(portal handoff + loopback PKCE; see `docs/desktop-auth-handoff.md`).
 
 ---
 
@@ -28,7 +31,7 @@ Remaining gaps are smaller: no audio-format negotiation, no interactive OIDC log
 |---|---|---|---|
 | WebSocket auth | `Sec-WebSocket-Protocol: bearer.<jwt>`; rejects `?token=` (4401) | Sends exact subprotocol on both sockets | OK |
 | HTTP auth | `Authorization: Bearer <jwt>` | Set on the shared `httpx` client | OK |
-| Token issuance | OIDC PKCE `GET /auth/{provider}/authorize`, `POST /auth/{provider}/token`, `POST /auth/refresh` (rotating), `POST /auth/logout` | Exchanges and rotates via `POST /auth/refresh`; no interactive browser OIDC flow | PARTIAL |
+| Token issuance | OIDC PKCE `GET /auth/{provider}/authorize`, `POST /auth/{provider}/token`, `POST /auth/refresh` (rotating), `POST /auth/logout`; portal `GET /web/desktop-login` + `POST /auth/handoff` | First-run login uses the portal handoff (browser opens `/web/desktop-login`, one-time code redeemed at `/auth/handoff`); rotates via `POST /auth/refresh` and persists the rotated refresh token in the OS credential store | OK (IdP redirect registration is a deployment item) |
 | Token lifetime | 60 min (`ACCESS_TOKEN_EXPIRE_MINUTES`) | Refreshes ahead of expiry, on HTTP 401, and once on a 4401 WS rejection (needs `DESKTOP_REFRESH_TOKEN` + `DESKTOP_DEVICE_ID`) | OK |
 | Acceptable use | `GET /policies/acceptable-use` → `{version,text,effective_at}` | Reads `version`; policy text not displayed | PARTIAL |
 | Preflight | `POST /sessions/preflight` (`kind`, ack version) → `can_start`, `blockers`, `warnings`, `policies` | Aborts on blockers; shows the first warning; takes the answer model from `policies.providers.llm.answer_generation` | OK |
@@ -139,7 +142,11 @@ Conclusion: `?source=mic|loopback` is now implemented and maps mic→`candidate`
 
 ### Client-side
 
-1. **No interactive OIDC login** — the client cannot obtain the first token pair itself; it needs `DESKTOP_ACCESS_TOKEN` (and optionally refresh credentials) supplied by the auth flow. Refresh is implemented; login is not.
+1. **Interactive login — implemented.** The client obtains its first token pair
+   through the backend portal handoff (loopback PKCE + one-time code) and
+   persists the rotating refresh token in Windows Credential Manager. The
+   remaining deployment item is the IdP redirect allowlist for the loopback URI;
+   `DESKTOP_ACCESS_TOKEN` remains a dev/CI override.
 2. **`debrief.status_changed` is only logged** — polling remains the source of truth.
 3. **Loopback capture is not implemented** — `DESKTOP_AUDIO_SOURCE=loopback` labels the stream correctly but only mic audio is captured, so it is a test/tooling setting, not a product path yet.
 
@@ -181,7 +188,9 @@ QT_QPA_PLATFORM=offscreen pytest -q
 ## 6. Recommended order
 
 1. Server: audio-format negotiation (`session.status_changed` or `/audio-config`).
-2. Client: interactive OIDC login (loopback PKCE) so a token pair can be obtained without hand-pasting.
+2. ~~Client: interactive OIDC login~~ — implemented as the portal handoff
+   (`docs/desktop-auth-handoff.md`); the IdP redirect allowlist is the remaining
+   deployment step.
 3. Client: drive the debrief UI from `debrief.status_changed`.
 4. Client: implement loopback capture, then set `DESKTOP_AUDIO_SOURCE=loopback` for real interviewer audio.
 5. Run the live smoke with real provider keys and the §10.6 stealth matrix.

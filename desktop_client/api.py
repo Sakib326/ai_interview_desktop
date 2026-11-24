@@ -11,7 +11,7 @@ import asyncio
 import base64
 import json
 import logging
-from typing import Any, AsyncIterator, Dict, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, Optional, Tuple
 
 import httpx
 
@@ -112,8 +112,10 @@ class ApiClient:
         settings: Settings,
         *,
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        on_tokens_rotated: Optional[Callable[[], None]] = None,
     ):
         self.settings = settings
+        self._on_tokens_rotated = on_tokens_rotated
         self._refresh_lock = asyncio.Lock()
         self._client = httpx.AsyncClient(
             base_url=settings.api_v1,
@@ -171,6 +173,11 @@ class ApiClient:
         self.settings.device_id = data.get("device_id") or self.settings.device_id
         self._client.headers["Authorization"] = f"Bearer {access}"
         logger.info("Access token refreshed")
+        if self._on_tokens_rotated is not None:
+            try:
+                self._on_tokens_rotated()
+            except Exception:  # pragma: no cover - persistence must not break I/O
+                logger.exception("Token rotation callback failed")
         return True
 
     async def ensure_fresh_token(
